@@ -22,4 +22,4 @@ The project adds PP and EP, detailed **NVIDIA Nsight Systems profiling**, traini
 
 ## AI-Generated Content
 
-AI generated portions of the training startup scripts, profiling setup, MoE **loss collection** (not the MoE module itself), and project-structure cleanup/refactoring. AI was used for these routine, relatively trivial support tasks rather than the core implementation.
+AI generated portions of the training startup scripts, profiling setup, MoE **loss collection** (not the MoE module itself), and project-structure cleanup/refactoring and some local test cases (not included in the repo). AI was used for these routine, relatively trivial support tasks rather than the core implementation.
