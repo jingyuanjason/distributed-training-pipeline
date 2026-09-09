@@ -1,0 +1,41 @@
+general:
+  device: gpu
+  n_workers: 1
+  gpu_per_node: 1
+  info_src: 0
+  checkpoint_folder: ../checkpoints
+data:
+  vocab_size: 256
+  train_dataset_path: ../data/synthetic.npy
+  seed: 42
+  validate_dataset: true
+  validate_batches: true
+model:
+  num_head: 4
+  d_model: 64
+  d_ff: 128
+  context_len: 32
+  num_layers: 1
+  num_expert_per_node: 2
+profile:
+  enabled: false
+train:
+  router_aux_loss_coef: 0.01
+  data_parallel_num: 1
+  pipeline_parallel_stages: 1
+  microbatch_num: 2
+  batch_size: 4
+  save_interval: 2
+  target_iteration: 2
+  learning_rate: 0.0001
+  optimizer:
+    beta1: 0.9
+    beta2: 0.999
+    lambda: 0.01
+  learning_rate_scheduler:
+    a_max: 0.0001
+    a_min: 0.00001
+    t_w: 1
+    t_c: 10
+  print_loss_interval: 1
+  load_checkpoint_path: ""

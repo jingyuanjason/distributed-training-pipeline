@@ -1,0 +1,64 @@
+general:
+  device: "gpu"
+  n_workers: 8
+  gpu_per_node: 8
+  # Rank used for logging globally aggregated loss metrics.
+  info_src: 6
+  checkpoint_folder: "/mnt/checkpoints/tiny-story/"
+  tokenizer_path: "/mnt/tokenizers/tiny-story/tokenizer-vocab10000.pkl"
+data:
+  vocab_size: 32000
+  train_dataset_path: "/mnt/dataset/tiny_story/train_dataset.npy"
+  valid_dataset_path: "/mnt/dataset/tiny_story/valid_dataset.npy"
+  seed: 42
+  validate_dataset: false
+  validate_batches: true
+model:
+  num_head: 32
+  d_model: 4096
+  d_ff: 8192
+  context_len: 8192
+  num_layers: 8
+  num_expert_per_node: 4
+profile:
+  # Bound Nsight capture after warmup; set enabled: false for normal training.
+  enabled: false
+  nsight_warmup: 5
+  nsight_iterations: 3
+  # Force CUPTI software tracing; Blackwell's default hardware tracing is not
+  # reliable in Modal's gVisor environment.
+  nsight_trace: "cuda-sw,nvtx,nccl"
+  output_dir: "/mnt/profile-data"
+  batch_size: 256
+  warmup: 10
+  profile_iteration: 100
+  backward: True
+  optimizer_step: True
+  data_type: float32
+train:
+  router_aux_loss_coef: 0.01
+  data_parallel_num: 2
+  pipeline_parallel_stages: 4
+  microbatch_num: 32
+  batch_size: 128
+  save_interval: 50
+  target_iteration: 5000
+  learning_rate: 0.0001
+  optimizer:
+    beta1: 0.9
+    beta2: 0.999
+    lambda: 0.01
+  learning_rate_scheduler:
+    a_max: 0.01
+    a_min: 0.0001
+    t_w: 5000
+    t_c: 20000
+  print_loss_interval: 1
+  validation_interval: 2000
+  load_checkpoint_path: ""
+eval:
+  user_input: "Hey "
+  max_context: 256
+  eval_checkpoint_path: "/mnt/checkpoints/tiny-story/checkpoint_20000_20260531025455.ckpt"
+  t: 1
+  p: 0
