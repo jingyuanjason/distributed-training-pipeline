@@ -1,6 +1,6 @@
 general:
   device: "gpu"
-  n_workers: 8
+  n_workers: 32
   gpu_per_node: 8
   # Rank used for logging globally aggregated loss metrics.
   info_src: 6
@@ -19,7 +19,7 @@ model:
   d_ff: 8192
   context_len: 8192
   num_layers: 8
-  num_expert_per_node: 4
+  num_expert_per_node: 1
 profile:
   # Bound Nsight capture after warmup; set enabled: false for normal training.
   enabled: false
@@ -37,7 +37,7 @@ profile:
   data_type: float32
 train:
   router_aux_loss_coef: 0.01
-  data_parallel_num: 2
+  data_parallel_num: 8
   pipeline_parallel_stages: 4
   microbatch_num: 32
   batch_size: 128

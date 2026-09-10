@@ -56,7 +56,7 @@ volume_checkpoints = modal.Volume.from_name("checkpoints", create_if_missing=Tru
     scaledown_window=10,
     timeout=60 * 60 * 12,
 )
-@modal.experimental.clustered(size=1)
+@modal.experimental.clustered(size=4)
 def profile_wrapper(config):
     validate_config(config, check_data=True, check_cuda=True)
     if config["general"]["n_workers"] != 8:

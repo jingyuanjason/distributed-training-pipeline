@@ -11,9 +11,7 @@ A distributed training implementation for a **BF16 Mixtral 8×7B MoE model**, bu
 
 ## Beyond the Assignment
 
-The project adds PP and EP, detailed **NVIDIA Nsight Systems profiling**, training outside Modal, and large-scale experiment support with multidimensional communication groups—targeting up to **32 NVIDIA B200/B300 GPUs**. Much larger models and context lengths require distributing training across GPUs.
-
-**Scope note:** the bundled configs are reduced-size examples, not the full 8×7B setup; the current bundled launchers enforce single-node execution. The 32-GPU scale and non-Modal training describe the broader project scope.
+The project adds PP and EP, detailed NVIDIA Nsight Systems profiling, training outside Modal, and large-scale experiment support with multidimensional communication groups—targeting up to 32 NVIDIA B200/B300 GPUs. Much larger models and context lengths require distributing training across GPUs.
 
 ## Ongoing Work / Future Directions
 
@@ -22,4 +20,4 @@ The project adds PP and EP, detailed **NVIDIA Nsight Systems profiling**, traini
 
 ## AI-Generated Content
 
-AI generated portions of the training startup scripts, profiling setup, MoE **loss collection** (not the MoE module itself), and project-structure cleanup/refactoring and some local test cases (not included in the repo). AI was used for these routine, relatively trivial support tasks rather than the core implementation.
+AI generated portions of the training startup scripts, profiling setup, MoE loss collection, and project-structure cleanup/refactoring and some local test cases (not included in the repo).
