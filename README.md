@@ -1,6 +1,6 @@
 # Distributed MoE Training Pipeline
 
-A distributed training implementation for a **BF16 Mixtral 8×7B MoE model**, built on [Stanford CS336 Assignment 2](https://github.com/stanford-cs336/assignment2-systems) with substantial extensions.
+A distributed training implementation for a **BF16 Mixtral 8×7B MoE model**, inspired by [Stanford CS336 LLM System Project](https://github.com/stanford-cs336/assignment2-systems) with substantial extensions.
 
 ## Implementation
 
