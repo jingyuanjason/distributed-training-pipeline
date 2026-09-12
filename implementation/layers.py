@@ -125,27 +125,19 @@ class MoELayerMulti(nn.Module):
             self.world_size = dp_group.size()
         self.k = k
         self.num_expert_per_node = num_expert_per_node
-        self.experts = nn.ModuleList([PositionWiseFFLayer(d_model, d_ff, device=device, dtype=dtype) for _ in range(num_expert_per_node)]) # one expert per rank
+        self.experts = GroupedPositionWiseFFLayer(num_expert_per_node, d_model, d_ff, device=device, dtype=dtype)
         self.router = LinearLayer(d_model, self.world_size * num_expert_per_node, device=device, dtype=dtype)
     
-    def forward(self, x: torch.Tensor, return_aux_loss=False):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x B, S, D
         input_dtype = x.dtype
         x = x.to(self.dtype)
         batch_size, context_len = x.shape[:2]
         x = rearrange(x, "b c ... -> (b c) ...")
         logits = self.router(x)
-        probs, expert_idx = softmax(logits, dim_sum=-1).topk(self.k, dim=-1)
-        probs = probs / probs.sum(dim=-1, keepdim=True)
-        if return_aux_loss:
-            experts = self.world_size * self.num_expert_per_node
-            counts = torch.bincount(expert_idx.flatten(), minlength=experts).float()
-            if self.world_size > 1:
-                dist.all_reduce(counts, group=self.dp_group)
-            assignments = counts.sum().clamp_min(1)
-            # Global assignment fractions; scale local probabilities for FSDP's DP average.
-            mean_probs = logits.float().softmax(-1).sum(0) * (self.world_size * self.k / assignments)
-            aux_loss = experts * (counts / assignments * mean_probs).sum()
+        routing_res: torch.Tensor = softmax(logits, dim_sum=-1)
+        probs, expert_idx = routing_res.topk(self.k, dim=-1)
+        probs = probs/probs.sum(dim=-1, keepdim=True)
         len_each = expert_idx.shape[0]
         expert_idx = rearrange(expert_idx, " ... c d -> ... (c d)")
         out = torch.empty(expert_idx.shape[0], *x.shape[1:], dtype=x.dtype, device=x.device)
@@ -158,28 +150,76 @@ class MoELayerMulti(nn.Module):
             indices = (expert_idx == j).nonzero(as_tuple=True)[0]
             split_sizes.append(len(indices))
             expert_indices.append(indices)
+        
         sent_tensor = x[torch.cat(expert_indices, dim=0) % len_each, :]
 
 
         recv_tensors, recv_splits = TensorExchange().apply(sent_tensor, split_sizes, self.dp_group)
 
         chunks = torch.split(recv_tensors, recv_splits, dim=0)
-        chunks_output = [None for _ in range(len(chunks))]
+        expert_inputs = []
+        expert_inputs_size = []
+        expert_split_sizes = []
         for i in range(self.num_expert_per_node):
-            expert_input = torch.cat(chunks[i::self.num_expert_per_node], dim=0)
-            expert_this = self.experts[i]
-            expert_output = expert_this.forward(expert_input)
-            chunks_output[i::self.num_expert_per_node] = torch.split(expert_output, recv_splits[i::self.num_expert_per_node], dim=0)
+            expert_inputs.extend(chunks[i::self.num_expert_per_node])
+            expert_inputs_size.append(sum(x.shape[0] for x in chunks[i::self.num_expert_per_node]))
+            expert_split_sizes.extend(x.shape[0] for x in chunks[i::self.num_expert_per_node])
 
-        sent_tensors = torch.cat(chunks_output, dim=0)
+        expert_input = torch.cat(expert_inputs, dim=0)
+        expert_inputs_size = torch.tensor(expert_inputs_size)
+        expert_inputs_offset = torch.cumsum(torch.tensor(expert_inputs_size, device=expert_input.device))
+
+        expert_outputs = self.experts.forward(expert_input, expert_inputs_offset)
+        expert_outputs = torch.split(expert_outputs, expert_split_sizes)
+        expert_outputs_rearranged = []
+        for rank_idx in self.dp_group.size():
+            expert_outputs_rearranged.extend([expert_outputs[expert_idx * self.dp_group.size() + rank_idx ] for expert_idx in range(self.num_expert_per_node)])
+        
+
+        sent_tensors = torch.cat(expert_outputs_rearranged, dim=0)
         recv_tensors, _ = TensorExchange().apply(sent_tensors, recv_splits, self.dp_group)
                 
         out[torch.cat(expert_indices, dim=0), :] = recv_tensors
 
         out = rearrange(out, " ... (c d) e -> ... c d e", d=self.k)
         out = (out * probs.unsqueeze(dim=-1)).sum(dim=-2)
-        out = rearrange(out, "(b c) ... -> b c ...", b = batch_size, c = context_len).to(input_dtype)
-        return (out, aux_loss) if return_aux_loss else out
+        return rearrange(out, "(b c) ... -> b c ...", b = batch_size, c = context_len).to(input_dtype)
+
+class GroupedPositionWiseFFLayer(nn.Module):
+    def __init__(self, num_experts:int, d_model: int, d_ff: int, device=None, dtype=None):
+        super().__init__()
+        self.d_model = d_model
+        self.dff = d_ff
+        self.device = device
+        self.dtype = dtype
+        self.num_experts = num_experts
+        self.w1 = nn.Parameter(torch.nn.init.trunc_normal_(torch.Tensor(size=(num_experts, self.dff, self.d_model), device=device, dtype=dtype), 0, 1, -3, 3))
+        self.w2 = nn.Parameter(torch.nn.init.trunc_normal_(torch.Tensor(size=(num_experts, self.d_model, self.dff), device=device, dtype=dtype), 0, 1, -3, 3))
+        self.w3 = nn.Parameter(torch.nn.init.trunc_normal_(torch.Tensor(size=(num_experts, self.dff, self.d_model), device=device, dtype=dtype), 0, 1, -3, 3))
+     #   self.w1 = LinearLayer(self.d_model, self.dff, device=device, dtype=dtype)
+     #   self.w2 = LinearLayer(self.dff, self.d_model, device=device, dtype=dtype)
+     #   self.w3 = LinearLayer(self.d_model, self.dff, device=device, dtype=dtype)
+      #  self.silu = SiLuLayer()
+    
+    def forward(self, x: torch.Tensor, offsets: list) -> torch.Tensor:
+        x1 = F.grouped_mm(
+            x,
+            self.w1,
+            offs=offsets,
+        )
+        x1 = silu(x1)
+        x2 = F.grouped_mm(
+            x,
+            self.w3,
+            offs=offsets,
+        )
+        x1 = x1 * x2
+        x_out = F.grouped_mm(
+            x1,
+            self.w2,
+            offs=offsets,
+        )
+        return x_out
     
 class PositionWiseFFLayer(nn.Module):
     def __init__(self, d_model: int, d_ff: int, device=None, dtype=None):

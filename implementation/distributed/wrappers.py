@@ -90,7 +90,7 @@ class FSDPWrapperPipelined(nn.Module):
         for layer_name, submodule in dict(module.named_modules()).items():
             
             if "expert" in layer_name:
-                continue
+                submodule.compile()
             if isinstance(submodule, (LinearLayer, EmbeddingLayer)):
                 dist.broadcast(submodule.weight.data, dist.get_global_rank(FSDP_communication_group, 0), group=FSDP_communication_group)
                 assert submodule.weight.data.shape[0] % group_size == 0, (
