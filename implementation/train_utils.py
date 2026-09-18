@@ -1,4 +1,6 @@
 import os
+import copy
+import random
 
 import numpy as np
 import torch
@@ -126,8 +128,9 @@ def move_model_state(model: nn.Module):
     return model_cpu_snapshot
 
 def move_optimizer_state(optimizer: torch.optim.Optimizer):
-    optimizer_cpu_snapshot = {}
-    for param, state in optimizer.state.items():
+    optimizer_cpu_snapshot = copy.deepcopy(optimizer.state_dict()["param_groups"])
+    states = {}
+    for param, state in optimizer.state_dict()["state"].items():
         cpu_param_state = {}
         for key, value in state.items():
             if torch.is_tensor(value):
@@ -140,24 +143,44 @@ def move_optimizer_state(optimizer: torch.optim.Optimizer):
                 cpu_param_state[key] = cpu_tensor
             else:
                 cpu_param_state[key] = value
-        optimizer_cpu_snapshot[param] = cpu_param_state
-    return optimizer_cpu_snapshot
+        states[param] = cpu_param_state
+    return {"state": states, "param_groups": optimizer_cpu_snapshot}
 
 
-def save_checkpoint_async_dist(model: nn.Module, optimizer: torch.optim.Optimizer, iteration: int, checkpoint_dir: str | os.PathLike | BinaryIO | IO[bytes]):
+def save_checkpoint_async_dist(model: nn.Module, optimizer: torch.optim.Optimizer, iteration: int, checkpoint_dir: str | os.PathLike | BinaryIO | IO[bytes], data_rng=None):
 
     model_cpu_snapshot = move_model_state(model)
     optimizer_cpu_snapshot = move_optimizer_state(optimizer)
     checkpoint = {"model.state_dict": model_cpu_snapshot,
                   "optimizer.state_dict": optimizer_cpu_snapshot,
                   "iteration": iteration}
+    if data_rng is not None:
+        checkpoint["rng"] = {
+            "data": copy.deepcopy(data_rng.bit_generator.state),
+            "torch": torch.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+            "python": random.getstate(),
+        }
     torch.cuda.synchronize()
     executor = ThreadPoolExecutor(max_workers=1)
-    executor.submit(
-        torch.save,
-        checkpoint,
-        checkpoint_dir,
-    )
+    try:
+        return executor.submit(_write_checkpoint, checkpoint, checkpoint_dir)
+    finally:
+        # Release the executor without waiting for the background write.
+        executor.shutdown(wait=False)
+
+
+def _write_checkpoint(checkpoint, destination):
+    if not isinstance(destination, (str, os.PathLike)):
+        torch.save(checkpoint, destination)
+        return
+    temporary = os.fspath(destination) + ".tmp"
+    try:
+        torch.save(checkpoint, temporary)
+        os.replace(temporary, destination)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def load_checkpoint(src: str | os.PathLike | BinaryIO | IO[bytes], model: nn.Module, optimizer: torch.optim.Optimizer = None):
@@ -173,6 +196,7 @@ def load_checkpoint_async_dist(
     src: str | os.PathLike | BinaryIO | IO[bytes],
     model: nn.Module,
     optimizer: torch.optim.Optimizer = None,
+    data_rng=None,
 ):
 
     checkpoint = torch.load(src, map_location="cpu", weights_only=False)
@@ -182,23 +206,36 @@ def load_checkpoint_async_dist(
 
     if optimizer is not None:
         saved_state = checkpoint["optimizer.state_dict"]
-        params = [p for group in optimizer.param_groups for p in group["params"]]
-        saved_values = list(saved_state.values())
-        if len(saved_values) != len(params):
-            raise ValueError(
-                f"Checkpoint optimizer state has {len(saved_values)} entries, but the "
-                f"optimizer has {len(params)} parameters; cannot remap state."
-            )
+        if "param_groups" in saved_state:
+            optimizer.load_state_dict(saved_state)
+        else:
+            _load_legacy_optimizer(saved_state, optimizer)
 
-        state = {i: param_state for i, param_state in enumerate(saved_values)}
-        param_groups = []
-        offset = 0
-        for group in optimizer.param_groups:
-            n = len(group["params"])
-            serialized_group = {k: v for k, v in group.items() if k != "params"}
-            serialized_group["params"] = list(range(offset, offset + n))
-            offset += n
-            param_groups.append(serialized_group)
-        optimizer.load_state_dict({"state": state, "param_groups": param_groups})
-
+    if data_rng is not None:
+        rng = checkpoint.get("rng")
+        data_rng.bit_generator.state = rng["data"]
+        torch.set_rng_state(rng["torch"])
+        random.setstate(rng["python"])
+        if rng["cuda"] is not None:
+            torch.cuda.set_rng_state(rng["cuda"])
     return checkpoint["iteration"]
+
+
+def _load_legacy_optimizer(saved_state, optimizer):
+    params = [p for group in optimizer.param_groups for p in group["params"]]
+    saved_values = list(saved_state.values())
+    if len(saved_values) != len(params):
+        raise ValueError(
+            f"Checkpoint optimizer state invalid, failed to load"
+        )
+
+    state = {i: param_state for i, param_state in enumerate(saved_values)}
+    param_groups = []
+    offset = 0
+    for group in optimizer.param_groups:
+        n = len(group["params"])
+        serialized_group = {k: v for k, v in group.items() if k != "params"}
+        serialized_group["params"] = list(range(offset, offset + n))
+        offset += n
+        param_groups.append(serialized_group)
+    optimizer.load_state_dict({"state": state, "param_groups": param_groups})

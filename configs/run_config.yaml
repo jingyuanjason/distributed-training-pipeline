@@ -5,6 +5,9 @@ general:
   info_src: 0
   checkpoint_folder: "/mnt/checkpoints/tiny-story/"
   tokenizer_path: "/mnt/tokenizers/tiny-story/tokenizer-vocab10000.pkl"
+recovery:
+  max_restarts: 3 # torchrun worker-group restart budget (Modal launcher)
+  collective_timeout_seconds: 180
 data:
   vocab_size: 32000
   train_dataset_path: "/mnt/dataset/tiny_story/train_dataset.npy"

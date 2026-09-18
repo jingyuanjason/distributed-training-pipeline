@@ -70,7 +70,7 @@ def profile_wrapper(config):
     with tempfile.TemporaryDirectory(prefix="pipeline-training-") as directory:
         config_path = Path(directory) / "config.json"
         config_path.write_text(json.dumps(config), encoding="utf-8")
-        command = _build_torchrun_command(config_path, cluster.rank, general["n_workers"], general["gpu_per_node"])
+        command = _build_torchrun_command(config_path, cluster.rank, general["n_workers"], general["gpu_per_node"], config.get("recovery", {}).get("max_restarts", 3))
         if profile_enabled:
             nsys = shutil.which("nsys")
             if nsys is None:
@@ -89,7 +89,9 @@ def profile_wrapper(config):
             print(f"Committed Nsight report to the profile-data Volume: {report_path}", flush=True)
 
 
-def _build_torchrun_command(config_path, cluster_rank, world_size, gpu_per_node):
+def _build_torchrun_command(config_path, cluster_rank, world_size, gpu_per_node, max_restarts=3):
+    if not isinstance(max_restarts, int) or max_restarts < 0:
+        raise ValueError("recovery.max_restarts must be a nonnegative integer")
     if world_size < 1 or gpu_per_node < 1 or world_size % gpu_per_node:
         raise ValueError("n_workers must be positive and divisible by gpu_per_node")
     nnodes = world_size // gpu_per_node
@@ -104,6 +106,11 @@ def _build_torchrun_command(config_path, cluster_rank, world_size, gpu_per_node)
         f"--node-rank={cluster_rank}",
         f"--master-addr={os.environ.get('MASTER_ADDR', '127.0.0.1')}",
         f"--master-port={os.environ.get('MASTER_PORT', '29500')}",
+        f"--max-restarts={max_restarts}",
+        "--monitor-interval=1",
+        "--rdzv-backend=c10d",
+        f"--rdzv-endpoint=[{os.environ.get('MASTER_ADDR', '127.0.0.1')}]:{os.environ.get('MASTER_PORT', '29500')}",
+        f"--rdzv-id={os.environ.get('NCCL_HOSTID', 'pipeline').rsplit('-node-', 1)[0]}",
         "--module", "distributed_parallel_training_pipelined",
         "--config-path", str(config_path),
     ]

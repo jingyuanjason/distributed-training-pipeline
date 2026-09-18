@@ -2,6 +2,7 @@ import argparse
 import os
 from pathlib import Path
 import time
+from concurrent.futures import Future
 from contextlib import nullcontext
 from implementation.distributed.ddp_modules import FSDPWrapperPipelined
 import torch
@@ -14,33 +15,81 @@ from pipeline import pipelined_train_overlap
 from implementation.nnfunctions import cross_entropy, learning_rate_schedule_wrapper
 from implementation.optimizer import AdamW
 from implementation.train_utils import get_batch, load_checkpoint_async_dist, load_dataset, save_checkpoint_async_dist
-from datetime import datetime
+from datetime import datetime, timedelta
 
-
-def _train_worker(local_rank, cluster_rank, world_size, config):
-    try:
-        train(local_rank, cluster_rank, world_size, config)
-    finally:
-        if dist.is_initialized():
-            try:
-                torch.cuda.synchronize()
-                dist.barrier()
-            except Exception as error:
-                # A peer may already have failed, in which case a coordinated
-                # barrier is impossible. Still destroy this rank's communicators.
-                print(f"Rank {dist.get_rank()} could not synchronize during shutdown: {error}", flush=True)
-            finally:
-                dist.destroy_process_group()
 
 
 def _nvtx_range(name):
     return torch.cuda.nvtx.range(name) if torch.cuda.is_available() else nullcontext()
 
 
+def _latest_checkpoint(root, dp_size, pp_size, run=None):
+    candidates = []
+    for marker in Path(root).glob(f"{run or '*'}/*/COMMITTED"):
+        directory = marker.parent
+        if directory.name.isdigit() and all(
+            (directory / f"shaded_dp_{dp}_pp_{pp}.ckpt").is_file()
+            for dp in range(dp_size) for pp in range(pp_size)
+        ):
+            candidates.append(directory)
+    return max(candidates, key=lambda p: (p.parent.name, int(p.name)), default=None)
+
+
+def _select_checkpoint(config, rank, info_src):
+    selection = [None, None]
+    if rank == info_src:
+        try:
+            settings = config["train"]
+            load_checkpoint_path = settings.get("load_checkpoint_path")
+            root = Path(config["general"]["checkpoint_folder"]) / "checkpoint"
+            if load_checkpoint_path:
+                path = Path(load_checkpoint_path)
+                if int(os.environ.get("TORCHELASTIC_RESTART_COUNT", "0")):
+                    found = _latest_checkpoint(path.parent.parent, settings["data_parallel_num"], settings["pipeline_parallel_stages"], run=path.parent.name)
+                    if found is not None and found.parent == path.parent:
+                        path = found
+                if not (path / "COMMITTED").is_file():
+                    raise ValueError(f"Checkpoint is not committed: {path}")
+            else:
+                path = _latest_checkpoint(root, settings["data_parallel_num"], settings["pipeline_parallel_stages"])
+            selection[0] = str(path) if path is not None else None
+        except Exception as error:
+            selection[1] = str(error)
+    dist.broadcast_object_list(selection, src=info_src)
+    if selection[1]:
+        raise RuntimeError(selection[1])
+    return selection[0]
+
+
+def _verify_pending_checkpoints(pending, iteration, rank, info_src, device, drain=False):
+    while pending and (drain or iteration - pending[0][0] >= 5):
+        saved_iteration, checkpoint_dir, future = pending[0]
+        success = 1
+        try:
+            future.result()
+        except Exception as error:
+            success = 0
+            print(f"Rank {rank} checkpoint at iteration {saved_iteration} failed: {error}", flush=True)
+
+        status = torch.tensor(success, dtype=torch.int32, device=device)
+        dist.all_reduce(status, op=dist.ReduceOp.MIN)
+        if rank == info_src:
+            if status.item() == 1:
+                message = f"Checkpoint at iteration {saved_iteration} committed: all ranks saved successfully."
+                marker = Path(checkpoint_dir, "COMMITTED.tmp")
+                marker.write_text(message + "\n", encoding="utf-8")
+                marker.replace(Path(checkpoint_dir, "COMMITTED"))
+                print(message, flush=True)
+            else:
+                print(f"Checkpoint at iteration {saved_iteration} not committed: at least one rank failed.", flush=True)
+        pending.pop(0)
+
+
 def train(local_rank, cluster_rank, world_size, config):
     glob_rank = int(os.environ["RANK"])
     torch.cuda.set_device(local_rank)
-    dist.init_process_group("nccl", init_method="env://", rank=glob_rank, world_size=world_size, device_id=torch.device("cuda", local_rank))
+    collective_timeout = timedelta(seconds=config.get("recovery", {}).get("collective_timeout_seconds", 180))
+    dist.init_process_group("nccl", init_method="env://", rank=glob_rank, world_size=world_size, device_id=torch.device("cuda", local_rank), timeout=collective_timeout)
 
     vocab_size = config.get("data").get("vocab_size")
     num_head = config.get("model").get("num_head")
@@ -88,17 +137,17 @@ def train(local_rank, cluster_rank, world_size, config):
     dp_group = None
     pp_group = None
     for dp_group_ranks in dp_groups:
-        dp_group_created = dist.new_group(ranks=dp_group_ranks)
+        dp_group_created = dist.new_group(ranks=dp_group_ranks, timeout=collective_timeout)
         if rank in dp_group_ranks:
             dp_group = dp_group_created
     for pp_group_ranks in pp_groups:
-        pp_group_created = dist.new_group(ranks=pp_group_ranks)
+        pp_group_created = dist.new_group(ranks=pp_group_ranks, timeout=collective_timeout)
         if rank in pp_group_ranks:
             pp_group = pp_group_created
 
     checkpoint_folder = config.get("general").get("checkpoint_folder")
     info_src = config.get("general").get("info_src")
-    load_checkpoint_path = config.get("train").get("load_checkpoint_path")
+    load_checkpoint_path = _select_checkpoint(config, rank, info_src)
     target_iteration = config.get("train").get("target_iteration")
 
     model = TransformerLMPipelined(
@@ -119,11 +168,14 @@ def train(local_rank, cluster_rank, world_size, config):
     optimizer = AdamW(model.parameters(), lr=learning_rate, betas=(optimizer_config["beta1"], optimizer_config["beta2"]), weight_decay=optimizer_config["lambda"])
 
     now = datetime.now()
-    train_start_time = now.strftime("%Y%m%d%H%M%S")
+    train_start_time = now.strftime("%Y%m%d%H%M%S%f")
     iteration = 0
+    data_rng = np.random.default_rng(data_seed + dp_idx)
     if load_checkpoint_path:
-        train_start_time, iteration = load_checkpoint_path.split("/")[-2:]
-        iteration = load_checkpoint_async_dist(load_checkpoint_path + f"/shaded_dp_{dp_idx}_pp_{pipeline_stage_this}.ckpt", model, optimizer)
+        train_start_time = Path(load_checkpoint_path).parent.name
+        iteration = load_checkpoint_async_dist(load_checkpoint_path + f"/shaded_dp_{dp_idx}_pp_{pipeline_stage_this}.ckpt", model, optimizer, data_rng=data_rng)
+        if iteration != int(Path(load_checkpoint_path).name):
+            raise ValueError("Checkpoint shard iteration does not match committed directory")
         print(f"loaded checkpoint at {iteration} iterations, training start time is {train_start_time}")
 
     obj_list = [train_start_time]
@@ -136,7 +188,6 @@ def train(local_rank, cluster_rank, world_size, config):
 
     dist.barrier()
     train_dataset = load_dataset(train_dataset_path, vocab_size=vocab_size, validate=validate_dataset)
-    data_rng = np.random.default_rng(data_seed + dp_idx)
 
     if rank == info_src:
         print(f"training start time {train_start_time}", flush=True)
@@ -144,6 +195,7 @@ def train(local_rank, cluster_rank, world_size, config):
     loss_acc = 0
     interval_duration = 0.0
     interval_tokens_processed = 0
+    pending_checkpoints = []
     final_iteration = min(target_iteration, profile_warmup + profile_iterations) if profile_enabled else target_iteration
     while iteration < final_iteration:
         iteration_range = f"train_iteration_{iteration}|rank={rank}|pp={pipeline_stage_this}|dp={dp_idx}"
@@ -171,7 +223,6 @@ def train(local_rank, cluster_rank, world_size, config):
                 for param_group in optimizer.param_groups:
                     param_group["lr"] = lr
 
-            # Align ranks so the measured pass represents the complete distributed step.
             with _nvtx_range("pre_step_synchronization"):
                 torch.cuda.synchronize()
                 dist.barrier()
@@ -216,13 +267,22 @@ def train(local_rank, cluster_rank, world_size, config):
                 interval_duration = 0.0
                 interval_tokens_processed = 0
 
+            _verify_pending_checkpoints(pending_checkpoints, iteration, rank, info_src, device)
+
             # save checkpoint
             if iteration % save_interval == 0:
                 with _nvtx_range("checkpoint_io"):
                     checkpoint_dir = f"{checkpoint_folder}/checkpoint/{train_start_time}/{iteration}"
-                    os.makedirs(checkpoint_dir, exist_ok=True)
-                    save_checkpoint_path = f"{checkpoint_dir}/shaded_dp_{dp_idx}_pp_{pipeline_stage_this}.ckpt"
-                    save_checkpoint_async_dist(model, optimizer, iteration, save_checkpoint_path)
+                    try:
+                        os.makedirs(checkpoint_dir, exist_ok=True)
+                        save_checkpoint_path = f"{checkpoint_dir}/shaded_dp_{dp_idx}_pp_{pipeline_stage_this}.ckpt"
+                        future = save_checkpoint_async_dist(model, optimizer, iteration, save_checkpoint_path, data_rng=data_rng)
+                    except Exception as error:
+                        future = Future()
+                        future.set_exception(error)
+                    pending_checkpoints.append((iteration, checkpoint_dir, future))
+
+    _verify_pending_checkpoints(pending_checkpoints, iteration, rank, info_src, device, drain=True)
 
 
 def main(argv=None):
@@ -239,7 +299,13 @@ def main(argv=None):
         raise ValueError("torchrun WORLD_SIZE does not match general.n_workers")
     if int(os.environ["LOCAL_WORLD_SIZE"]) != config["general"]["gpu_per_node"]:
         raise ValueError("torchrun LOCAL_WORLD_SIZE does not match general.gpu_per_node")
-    _train_worker(int(os.environ["LOCAL_RANK"]), int(os.environ["GROUP_RANK"]), world_size, config)
+
+
+    try:
+        train(int(os.environ["LOCAL_RANK"]), int(os.environ["GROUP_RANK"]), world_size, config)
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":

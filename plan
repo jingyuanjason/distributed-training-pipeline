@@ -1,0 +1,39 @@
+Yes. The safe approach is __restart the entire worker group through `torchrun`__, rather than try to reuse NCCL communicators after a rank fails.
+
+I found three gaps:
+
+- The launcher does not enable automatic restarts.
+- Shutdown performs a barrier even after failure, which can delay exiting.
+- Checkpoints are written asynchronously without checking completion, so the latest directory may contain incomplete shards.
+
+### Proposed changes
+
+1. __Coordinated restart__
+
+   - Enable a bounded restart budget in the launcher, initially 3 retries.
+   - Configure communication timeouts and NCCL error handling.
+   - Let rank failures propagate promptly without a shutdown barrier on the failure path. `torchrun` will terminate and relaunch the worker group.
+
+2. __Reliable distributed checkpoints__
+
+   - Write each rank’s shard to a temporary file, then atomically rename it.
+   - Publish a completion manifest only after every rank successfully finishes saving.
+   - Save model, optimizer, iteration, and random-generator states so batch sampling resumes correctly.
+   - Initially use coordinated, completed saves rather than unchecked background writes, trading some checkpoint-time overhead for reliability.
+
+3. __Automatic recovery__
+
+   - Maintain a stable run identity across worker restarts.
+   - Have one rank select the latest completed checkpoint for that run and broadcast the selection.
+   - Restore all shards at the same iteration; ignore incomplete checkpoint directories.
+   - If failure occurs before the first checkpoint, restart from initialization. Preserve explicit checkpoint loading.
+
+4. __Validation and documentation__
+
+   - Add tests for incomplete checkpoints, state restoration, and restart configuration.
+   - Run a small CPU-based `torchrun` failure-injection test to verify whole-group restart; full NCCL validation requires suitable GPUs.
+   - Update launch instructions and the Modal launcher, since worker-code changes alone cannot enable `torchrun` retries.
+
+I’ll preserve your existing uncommitted change in `/home/jingyuan_li/pipeline_training/distributed_parallel_training_pipelined.py`.
+
+__Requirements:__ multi-node recovery needs checkpoint storage visible consistently to every rank and the same worker topology. Replacing a lost machine requires infrastructure support beyond this script.

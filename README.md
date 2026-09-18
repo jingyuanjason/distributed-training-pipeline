@@ -24,7 +24,7 @@ Edit [the run configuration](configs/run_config.yaml): set `data.train_dataset_p
 Launch the default single-node topology:
 
 ```bash
-torchrun --standalone --nnodes=1 --nproc-per-node=8 \
+torchrun --standalone --nnodes=1 --nproc-per-node=8 --max-restarts=3 \
   --module distributed_parallel_training_pipelined \
   --config-path configs/run_config.yaml
 ```
@@ -38,6 +38,32 @@ modal run modal_wrapper.py --config-path configs/run_config.yaml
 ```
 
 The [Modal wrapper](modal_wrapper.py) currently requests one node with eight B300 GPUs. Keep its GPU request and cluster size consistent with the configuration. Leave `profile.enabled: false` for normal training; Modal profiling requires `nsys` in the training image.
+
+## Recovery
+
+On startup, one rank discovers the latest complete `COMMITTED` checkpoint under
+`general.checkpoint_folder/checkpoint` and broadcasts its path to all ranks.
+Incomplete saves are ignored. Model, optimizer, iteration (and hence LR schedule),
+data-sampling RNG, and Torch/Python RNG states are restored. With no committed
+checkpoint, training starts from scratch. Use a separate checkpoint folder per
+experiment; automatic selection orders run directories by timestamp, then step.
+`train.load_checkpoint_path` pins the initial checkpoint; elastic retries advance
+to the latest committed step in that run. Older checkpoints without RNG state are
+rejected for recovery rather than silently repeating data.
+
+`torchrun --max-restarts=3` kills and recreates the worker group after a rank fails;
+the Modal launcher sets this from `recovery.max_restarts` (default 3). For multi-node
+launches, use a fixed node count, `--rdzv-backend=c10d`, and the same unique
+`--rdzv-id` and reachable `--rdzv-endpoint=HOST:PORT` on every node. Do not run
+independent jobs against the same checkpoint directory. Topology, model, dataset,
+and training settings must remain unchanged. Checkpoint storage must provide
+shared visibility and atomic rename across ranks. Modal Volume snapshots are not
+a substitute for a coherent shared filesystem across multiple containers.
+
+The collective timeout defaults to 180 seconds and is configurable through
+`recovery.collective_timeout_seconds`. Restart budgets are finite; whole-node or
+launcher failures need external infrastructure to relaunch/replace the node.
+Publication protects against worker interruption, not storage loss or corruption.
 
 ## Topology
 
