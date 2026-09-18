@@ -4,10 +4,40 @@ A distributed training implementation for a **BF16 Mixtral 8×7B MoE model**, in
 
 ## Implementation
 
-- **Fully Sharded Data Parallel (FSDP):** custom parameter sharding and gradient synchronization in [distributed wrappers](implementation/distributed/wrappers.py).
-- **Data Parallel (DP):** data distribution and multidimensional communication-group setup in [training orchestration](train.py).
+- **Fully Sharded Data Parallel (FSDP):** custom parameter sharding and gradient synchronization in [distributed wrappers](implementation/distributed/ddp_modules.py).
+- **Data Parallel (DP):** data distribution and multidimensional communication-group setup in [training orchestration](distributed_parallel_training_pipelined.py).
 - **Expert Parallel (EP):** distributed experts and all-to-all token routing in [MoE layers](implementation/layers.py).
-- **Pipeline Parallel (PP):** microbatch scheduling and communication overlap in [pipeline training](implementation/pipeline/pipelined_train_overlap.py).
+- **Pipeline Parallel (PP):** microbatch scheduling and communication overlap in [pipeline training](pipeline/pipelined_train_overlap.py).
+
+## Running the Project
+
+Use Python 3.12 or 3.13 on Linux with CUDA/NCCL and BF16-capable NVIDIA GPUs. Run the following commands from the repository root:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -e .
+```
+
+Edit [the run configuration](configs/run_config.yaml): set `data.train_dataset_path` to an existing 1D integer NumPy `.npy` token array (IDs in `[0, vocab_size)`, longer than `model.context_len`) and `general.checkpoint_folder` to a writable directory. Use absolute paths. The default configuration uses **one node with eight GPUs** and a large model; adjust model and batch sizes to fit your GPU memory. Keep `data_parallel_num * pipeline_parallel_stages == n_workers` and `batch_size` divisible by `data_parallel_num * microbatch_num`.
+
+Launch the default single-node topology:
+
+```bash
+torchrun --standalone --nnodes=1 --nproc-per-node=8 \
+  --module distributed_parallel_training_pipelined \
+  --config-path configs/run_config.yaml
+```
+
+The process count must match both `general.gpu_per_node` and `general.n_workers` for a single-node run.
+
+**Modal alternative:** authenticate with `modal setup`, create/populate the `datasets` Modal Volume with tokens matching the configured path under `/mnt/dataset`, then run:
+
+```bash
+modal run modal_wrapper.py --config-path configs/run_config.yaml
+```
+
+The [Modal wrapper](modal_wrapper.py) currently requests one node with eight B300 GPUs. Keep its GPU request and cluster size consistent with the configuration. Leave `profile.enabled: false` for normal training; Modal profiling requires `nsys` in the training image.
 
 ## Topology
 
