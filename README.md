@@ -10,7 +10,6 @@ A distributed training implementation for a **BF16 Mixtral 8×7B MoE model**, in
 - **Pipeline Parallel (PP):** microbatch scheduling and communication overlap in [pipeline training](pipeline/pipelined_train_overlap.py).
 - **Training checkpoints:** improve distributed checkpoint saving and restoration for reliable training resumption.
 
-
 ## Running the Project
 
 Use Python 3.12 or 3.13 on Linux with CUDA/NCCL and BF16-capable NVIDIA GPUs. Run the following commands from the repository root:
@@ -80,6 +79,7 @@ The project adds PP and EP, detailed NVIDIA Nsight Systems profiling, training o
 
 ## Ongoing Work / Future Directions
 
+- **RL Training Integration** Trace collection from RL rollout workers
 - **Tensor Parallelism (TP):** shard computation within layers across GPUs, complementing the existing PP, DP, FSDP, and EP setup.
 
 ## AI-Generated Content
