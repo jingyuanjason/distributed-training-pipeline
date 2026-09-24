@@ -8,7 +8,7 @@ A distributed training implementation for a **BF16 Mixtral 8×7B MoE model**, in
 - **Data Parallel (DP):** data distribution and multidimensional communication-group setup in [training orchestration](distributed_parallel_training_pipelined.py).
 - **Expert Parallel (EP):** distributed experts and all-to-all token routing in [MoE layers](implementation/layers.py).
 - **Pipeline Parallel (PP):** microbatch scheduling and communication overlap in [pipeline training](pipeline/pipelined_train_overlap.py).
-- **Training checkpoints:** improve distributed checkpoint saving and restoration for reliable training resumption.
+- **Training checkpoints:** improve distributed checkpoint saving (CPU Staging) and restoration for reliable training resumption.
 
 ## Running the Project
 
@@ -73,9 +73,6 @@ The current multi-node topology is designed to match the communication character
 - **Intra-node: Data Parallel (DP) and Expert Parallel (EP)** groups are placed **within the same node**, where high-speed NVLink is available. Both DP (gradient synchronization) and EP (all-to-all token routing) are bandwidth-intensive, so they benefit from NVLink's high intra-node bandwidth.
 - **Inter-node: Pipeline Parallel (PP)** stages are placed **across different nodes**, since PP communication is limited to sending activations forward and gradients backward between adjacent stages—point-to-point transfers that are small enough to tolerate slower inter-node networking.
 
-## Beyond the CS336 Project
-
-The project adds PP and EP, detailed NVIDIA Nsight Systems profiling, training outside Modal, and large-scale experiment support with multidimensional communication groups—targeting up to 32 NVIDIA B200/B300 GPUs. Much larger models and context lengths require distributing training across GPUs.
 
 ## Ongoing Work / Future Directions
 
