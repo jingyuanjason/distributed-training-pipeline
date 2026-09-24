@@ -8,6 +8,8 @@ A distributed training implementation for a **BF16 Mixtral 8×7B MoE model**, in
 - **Data Parallel (DP):** data distribution and multidimensional communication-group setup in [training orchestration](distributed_parallel_training_pipelined.py).
 - **Expert Parallel (EP):** distributed experts and all-to-all token routing in [MoE layers](implementation/layers.py).
 - **Pipeline Parallel (PP):** microbatch scheduling and communication overlap in [pipeline training](pipeline/pipelined_train_overlap.py).
+- **Training checkpoints:** improve distributed checkpoint saving and restoration for reliable training resumption.
+
 
 ## Running the Project
 
@@ -19,7 +21,7 @@ source .venv/bin/activate
 python -m pip install -e .
 ```
 
-Edit [the run configuration](configs/run_config.yaml): set `data.train_dataset_path` to an existing 1D integer NumPy `.npy` token array (IDs in `[0, vocab_size)`, longer than `model.context_len`) and `general.checkpoint_folder` to a writable directory. Use absolute paths. The default configuration uses **one node with eight GPUs** and a large model; adjust model and batch sizes to fit your GPU memory. Keep `data_parallel_num * pipeline_parallel_stages == n_workers` and `batch_size` divisible by `data_parallel_num * microbatch_num`.
+Edit [the run configuration](configs/run_config.yaml): set `data.train_dataset_path` to an existing 1D integer NumPy `.npy` token array (IDs in `[0, vocab_size)`, longer than `model.context_len`) and `general.checkpoint_folder` to a writable directory. adjust model and batch sizes to fit your GPU memory. Keep `data_parallel_num * pipeline_parallel_stages == n_workers` and `batch_size` divisible by `data_parallel_num * microbatch_num`.
 
 Launch the default single-node topology:
 
@@ -78,7 +80,6 @@ The project adds PP and EP, detailed NVIDIA Nsight Systems profiling, training o
 
 ## Ongoing Work / Future Directions
 
-- **Training checkpoints:** improve distributed checkpoint saving and restoration for reliable training resumption.
 - **Tensor Parallelism (TP):** shard computation within layers across GPUs, complementing the existing PP, DP, FSDP, and EP setup.
 
 ## AI-Generated Content
