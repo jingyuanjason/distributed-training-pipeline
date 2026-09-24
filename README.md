@@ -8,7 +8,7 @@ A distributed training implementation for a **BF16 Mixtral 8×7B MoE model**, in
 - **Data Parallel (DP):** data distribution and multidimensional communication-group setup in [training orchestration](distributed_parallel_training_pipelined.py).
 - **Expert Parallel (EP):** distributed experts and all-to-all token routing in [MoE layers](implementation/layers.py).
 - **Pipeline Parallel (PP):** microbatch scheduling and communication overlap in [pipeline training](pipeline/pipelined_train_overlap.py).
-- **Training checkpoints:** improve distributed checkpoint saving (CPU Staging) and restoration for reliable training resumption.
+- **Asynchronous training checkpoints:** improve distributed checkpoint saving (CPU Staging) and restoration for reliable training resumption.
 
 ## Running the Project
 
