@@ -40,31 +40,6 @@ modal run modal_wrapper.py --config-path configs/run_config.yaml
 
 The [Modal wrapper](modal_wrapper.py) currently requests one node with eight B300 GPUs. Keep its GPU request and cluster size consistent with the configuration. Leave `profile.enabled: false` for normal training; Modal profiling requires `nsys` in the training image.
 
-## Recovery
-
-On startup, one rank discovers the latest complete `COMMITTED` checkpoint under
-`general.checkpoint_folder/checkpoint` and broadcasts its path to all ranks.
-Incomplete saves are ignored. Model, optimizer, iteration (and hence LR schedule),
-data-sampling RNG, and Torch/Python RNG states are restored. With no committed
-checkpoint, training starts from scratch. Use a separate checkpoint folder per
-experiment; automatic selection orders run directories by timestamp, then step.
-`train.load_checkpoint_path` pins the initial checkpoint; elastic retries advance
-to the latest committed step in that run. Older checkpoints without RNG state are
-rejected for recovery rather than silently repeating data.
-
-`torchrun --max-restarts=3` kills and recreates the worker group after a rank fails;
-the Modal launcher sets this from `recovery.max_restarts` (default 3). For multi-node
-launches, use a fixed node count, `--rdzv-backend=c10d`, and the same unique
-`--rdzv-id` and reachable `--rdzv-endpoint=HOST:PORT` on every node. Do not run
-independent jobs against the same checkpoint directory. Topology, model, dataset,
-and training settings must remain unchanged. Checkpoint storage must provide
-shared visibility and atomic rename across ranks. Modal Volume snapshots are not
-a substitute for a coherent shared filesystem across multiple containers.
-
-The collective timeout defaults to 180 seconds and is configurable through
-`recovery.collective_timeout_seconds`. Restart budgets are finite; whole-node or
-launcher failures need external infrastructure to relaunch/replace the node.
-Publication protects against worker interruption, not storage loss or corruption.
 
 ## Topology
 
@@ -74,6 +49,23 @@ The current multi-node topology is designed to match the communication character
 - **Inter-node: Pipeline Parallel (PP)** stages are placed **across different nodes**, since PP communication is limited to sending activations forward and gradients backward between adjacent stages—point-to-point transfers that are small enough to tolerate slower inter-node networking.
 
 
+## Recovery
+
+1. **Discover:** On startup, one rank selects the latest committed checkpoint and
+   broadcasts its path to all ranks, ignoring incomplete saves. Without a committed
+   checkpoint, training starts from scratch.
+2. **Restore:** All ranks reload model, optimizer, iteration/LR schedule, and
+   sampling and Torch/Python RNG states. Checkpoints missing RNG state are rejected.
+3. **Restart:** If a rank fails, the launcher recreates the entire worker group,
+   which resumes from the latest committed step. An explicitly selected checkpoint
+   sets the initial restore point; retries advance within that same run.
+
+Recovery requires unchanged topology, model, dataset, and training settings, plus
+shared checkpoint storage with atomic rename. Keep checkpoint directories separate
+per experiment; multi-node workers must join the same rendezvous. Restart attempts
+are bounded, and node or launcher failures require external relaunch. Checkpoint
+publication does not protect against storage loss or corruption.
+
 ## Ongoing Work / Future Directions
 
 - **RL Training Integration** Trace collection from RL rollout workers
@@ -81,4 +73,4 @@ The current multi-node topology is designed to match the communication character
 
 ## AI-Generated Content
 
-AI generated portions of the training startup scripts, profiling setup, MoE loss collection, and project-structure cleanup/refactoring and some local test cases (not included in the repo).
+AI generated portions of the training startup scripts, profiling setup, MoE loss collection, and project-structure cleanup/refactoring and some local test cases (not included in the repo). Also used AI for debugging.

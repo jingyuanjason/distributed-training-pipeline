@@ -1,5 +1,5 @@
 // flash_attention.cu
-// FlashAttention CUDA Kernel Submission
+// FlashAttention CUDA Kernel Submission (Not in use for distributed training, pytorch SPDA is faster)
 #include <cuda.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -36,7 +36,7 @@ using MmaAtomPV = MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>;
 using TiledMmaPV = TiledMMA<MmaAtomPV, Layout<Shape<_2, _2, _1>>,
                             Tile<_32, _32, _32>>;
 // ------------------------------------------------------------------------
-// CUDA Kernel Implementation
+// CUDA Kernel Implementation 
 // ------------------------------------------------------------------------
 
 
@@ -178,10 +178,7 @@ __global__ void flash_attention_kernel_v1(
 
     for(int kvOffset=0;kvOffset<seq_len; kvOffset += QUERY_PER_BLOCK){
 
-
       wmma::fill_fragment(acc_frag, 0.0f);
-
-
       pipeline.producer_acquire();
 
       cuda::memcpy_async(
@@ -346,9 +343,6 @@ __global__ void flash_attention_kernel_v1(
             __float2half_rn(tCrO[c](i) / tSumSeq(r));
       }
     }
-
-
-
 
 }
 
