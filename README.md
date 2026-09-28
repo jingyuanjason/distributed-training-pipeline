@@ -68,7 +68,9 @@ publication does not protect against storage loss or corruption.
 
 ## Ongoing Work / Future Directions
 
-- **RL Training Integration** Trace collection from RL rollout workers
+- **RL Training Integration (Ongoing)** Trace collection from RL rollout workers
+- **Formal Numerical Validator:** A general numerical validator for the distributed training pipeline
+- **Context Parallelism (CP):** Split super long context among ranks
 - **Tensor Parallelism (TP):** shard computation within layers across GPUs, complementing the existing PP, DP, FSDP, and EP setup.
 
 ## AI-Generated Content
