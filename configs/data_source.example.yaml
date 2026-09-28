@@ -1,0 +1,25 @@
+# Data source configuration for DatabasePromptLoader.
+#
+# Copy this file to `configs/data_source.yaml` and fill in your real
+# database credentials. `configs/data_source.yaml` is gitignored so
+# credentials are never committed.
+
+database:
+  host: localhost        # database host
+  port: 5432             # database port
+  dbname: rl_training    # database name
+  user: postgres         # database user
+  password: <fill-in>    # database password
+  sslmode: prefer        # disable | allow | prefer | require | verify-ca | verify-full
+  connect_timeout: 10    # seconds
+
+# SQL used to fetch a prompt. Replace with your own query.
+# The prompt table shape (see rl/worker_node/sql/create_tables.sql):
+#   prompts(id bigint, prompt_text text, priority integer)
+# Each row is returned to the caller as a dict, e.g.:
+#   {"id": 1, "prompt_text": "...", "priority": 0}
+prompt_query: |
+  SELECT id, prompt_text, priority
+  FROM prompts
+  ORDER BY priority DESC, id ASC
+  LIMIT 1;
