@@ -1,0 +1,33 @@
+# vLLM service configuration for RL rollout workers.
+#
+# The rollout worker (rl/worker_node/rl_worker.py) reads this file to learn
+# how to reach the vLLM server attached to it and how to sample generations.
+
+vllm:
+  host: localhost
+  port: 8088
+  # Served model id; must match the id the server was started with
+  # (see rl/llm_host/start_vllm.py). Used for /v1/completions requests and as
+  # a fallback model_version if the server does not report one.
+  model_id: allenai/OLMo-2-0425-1B
+  health_path: /health
+  request_timeout_seconds: 300
+  health_timeout_seconds: 5
+
+sampling:
+  temperature: 1.0
+  max_tokens: 512
+  top_p: 1.0
+  stop: ["</answer>"]
+  include_stop_str_in_output: true
+
+worker:
+  # Number of prompts sampled from the database per loop iteration.
+  prompt_group_size: 8
+  # Number of rollouts generated per prompt (vLLM "n" parameter).
+  rollouts_per_prompt: 4
+  # How long to sleep when vLLM is down or no prompts are available.
+  retry_interval_seconds: 10
+  # Optional explicit model version tag. If empty, the worker uses the model
+  # id reported by the vLLM server (/v1/models).
+  model_version: ""

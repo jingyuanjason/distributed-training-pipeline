@@ -7,19 +7,14 @@
 database:
   host: localhost        # database host
   port: 5432             # database port
-  dbname: rl_training    # database name
-  user: postgres         # database user
-  password: <fill-in>    # database password
+  dbname: training_db    # database name
+  user: training_db_user         # database user
+  password: trainingpassword    # database password
   sslmode: prefer        # disable | allow | prefer | require | verify-ca | verify-full
   connect_timeout: 10    # seconds
 
-# SQL used to fetch a prompt. Replace with your own query.
-# The prompt table shape (see rl/worker_node/sql/create_tables.sql):
-#   prompts(id bigint, prompt_text text, priority integer)
-# Each row is returned to the caller as a dict, e.g.:
-#   {"id": 1, "prompt_text": "...", "priority": 0}
-prompt_query: |
-  SELECT id, prompt_text, priority
-  FROM prompts
-  ORDER BY priority DESC, id ASC
-  LIMIT 1;
+# Prompts are sampled by leasing rows from the rollout_jobs queue; see
+# rl/worker_node/sql/batch_sample.sql and rl/worker_node/sql/complete_job.sql.
+# Each sampled prompt is returned to the caller as a dict, e.g.:
+#   {"job_id": 12, "run_id": "...", "prompt_id": 1, "policy_version": "v1",
+#    "status": "leased", "worker_id": "host-1", ..., "prompt_text": "..."}
