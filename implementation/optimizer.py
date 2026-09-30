@@ -8,6 +8,7 @@ class AdamW(torch.optim.Optimizer):
         defaults = {"lr":lr, "beta1": betas[0], "beta2": betas[1], "t":1, "epsilon": eps, "lambda_": weight_decay}
         super().__init__(params, defaults)
 
+    @torch.no_grad()
     def step(self, closure=None, **kwargs):
         for group in self.param_groups:
             a = group["lr"]
@@ -23,14 +24,19 @@ class AdamW(torch.optim.Optimizer):
 
                 state = self.state[p]
                 g = p.grad.data
-                p.data -= a * lambda_ * p.data
-                m = state.get("m", 0)
-                m = beta1 * m  + (1 - beta1) * g
-                state["m"] = m
-                v = state.get("v", 0)
-                v = beta2 * v + (1 - beta2) * (g ** 2)
-                state["v"] = v
-                p.data -= a_t * m / (torch.sqrt(v) + ep)
+                # In-place updates: fewer kernel launches and no temporaries,
+                # matching the original update equations exactly.
+                p.data.mul_(1 - a * lambda_)
+                m = state.get("m")
+                if m is None:
+                    m = state["m"] = torch.zeros_like(p)
+                m.mul_(beta1).add_(g, alpha=1 - beta1)
+                v = state.get("v")
+                if v is None:
+                    v = state["v"] = torch.zeros_like(p)
+                v.mul_(beta2).addcmul_(g, g, value=1 - beta2)
+                denom = v.sqrt().add_(ep)
+                p.data.addcdiv_(m, denom, value=-a_t)
             group["t"] = t+1
 
 

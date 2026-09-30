@@ -14,7 +14,7 @@ from implementation.layers import TransformerLMPipelined
 from pipeline import pipelined_train_overlap
 from implementation.nnfunctions import cross_entropy, learning_rate_schedule_wrapper
 from implementation.optimizer import AdamW
-from implementation.train_utils import get_batch, load_checkpoint_async_dist, load_dataset, save_checkpoint_async_dist
+from implementation.train_utils import compile_model, get_batch, load_checkpoint_async_dist, load_dataset, save_checkpoint_async_dist
 from datetime import datetime, timedelta
 
 
@@ -126,6 +126,10 @@ def train(local_rank, cluster_rank, world_size, config):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
         device = torch.device("cpu")
+    if device.type == "cuda":
+        # Enable TF32 for any remaining fp32 matmuls/convs (Ampere+); free speedup.
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
     rank = glob_rank
 
     assert pipeline_parallel_stages * data_parallel_num == world_size
@@ -164,6 +168,7 @@ def train(local_rank, cluster_rank, world_size, config):
         moe_compute_dtype=moe_compute_dtype,
     )
     model.to(device)
+    
     model = FSDPWrapperPipelined(model, FSDP_communication_group=dp_group, compute_dtype=fsdp_compute_dtype, moe_compute_dtype=moe_compute_dtype)
     optimizer = AdamW(model.parameters(), lr=learning_rate, betas=(optimizer_config["beta1"], optimizer_config["beta2"]), weight_decay=optimizer_config["lambda"])
 
@@ -188,7 +193,7 @@ def train(local_rank, cluster_rank, world_size, config):
 
     dist.barrier()
     train_dataset = load_dataset(train_dataset_path, vocab_size=vocab_size, validate=validate_dataset)
-
+    model = compile_model(model)
     if rank == info_src:
         print(f"training start time {train_start_time}", flush=True)
     print(f"Rank {rank} Ready, batch size {batch_size}, in this rank, batch size is {batch_size // data_parallel_num}", flush=True)
@@ -223,9 +228,11 @@ def train(local_rank, cluster_rank, world_size, config):
                 for param_group in optimizer.param_groups:
                     param_group["lr"] = lr
 
-            with _nvtx_range("pre_step_synchronization"):
-                torch.cuda.synchronize()
-                dist.barrier()
+            # Only hard-sync when profiling; otherwise keep the pipeline saturated.
+            if profile_enabled:
+                with _nvtx_range("pre_step_synchronization"):
+                    torch.cuda.synchronize()
+                    dist.barrier()
             pass_start_time = time.perf_counter()
             with _nvtx_range("pipeline_step|forward_backward_p2p_dp_sync_optimizer"):
                 loss_total = pipelined_train_overlap(
@@ -242,16 +249,20 @@ def train(local_rank, cluster_rank, world_size, config):
                     pp_group=pp_group,
                     dp_group=dp_group,
                 )
-            with _nvtx_range("post_step_synchronization"):
-                torch.cuda.synchronize()
-                dist.barrier()
+            # Only block on the GPU when we are about to consume the timing
+            # number (or profiling); per-interval timing stays accurate because
+            # the sync happens before the interval total is read.
+            if profile_enabled or (iteration + 1) % print_loss_interval == 0:
+                with _nvtx_range("post_step_synchronization"):
+                    torch.cuda.synchronize()
             pass_duration = time.perf_counter() - pass_start_time
 
             loss_acc += loss_total
             interval_duration += pass_duration
             interval_tokens_processed += batch_size * context_len
             iteration += 1
-            print(f"Rank {rank} finishes iteration {iteration}", flush=True)
+            if rank == info_src and iteration % print_loss_interval == 0:
+                print(f"Rank {rank} finishes iteration {iteration}", flush=True)
             if iteration % print_loss_interval == 0:
                 if rank == info_src:
                     tokens_per_second = interval_tokens_processed / interval_duration

@@ -58,7 +58,7 @@ train:
   data_parallel_num: 2
   pipeline_parallel_stages: 4
   microbatch_num: 32
-  batch_size: 128
+  batch_size: 192
   save_interval: 50
   target_iteration: 5000
   learning_rate: 0.0001

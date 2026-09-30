@@ -27,12 +27,17 @@ image = (
     # Required by Nsight's report importer.
     .apt_install("libdw1")
 )
-if (PROJECT_ROOT / "pyproject.toml").is_file():
-    image = image.pip_install_from_pyproject(str(PROJECT_ROOT / "pyproject.toml"))
-else:
-    image = image.pip_install(*requires("pipeline-training"))
+# Only resolve pip dependencies when building the image client-side; the
+# container re-imports this module to hydrate functions, where pyproject.toml
+# and the installed package metadata may be unavailable.
+if modal.is_local():
+    if (PROJECT_ROOT / "pyproject.toml").is_file():
+        image = image.pip_install_from_pyproject(str(PROJECT_ROOT / "pyproject.toml"))
+    else:
+        image = image.pip_install(*requires("pipeline-training"))
 image = (
     image
+    .add_local_file(str(PROJECT_ROOT / "pyproject.toml"), "/root/pyproject.toml")
     .add_local_dir(str(PROJECT_ROOT / "implementation"), "/root/implementation")
     .add_local_dir(str(PROJECT_ROOT / "pipeline"), "/root/pipeline")
     .add_local_file(str(PROJECT_ROOT / "distributed_parallel_training_pipelined.py"), "/root/distributed_parallel_training_pipelined.py")
@@ -55,7 +60,13 @@ volume_checkpoints = modal.Volume.from_name("checkpoints", create_if_missing=Tru
 def profile_wrapper(config):
     """Launch training on this node, optionally wrapping torchrun with Nsight."""
     cluster = modal.experimental.get_cluster_info()
-    os.environ["MASTER_ADDR"] = cluster.container_ips[0]
+    general = config["general"]
+    nnodes = general["n_workers"] // general["gpu_per_node"]
+    # Single-node jobs rendezvous over loopback: gVisor blocks hairpin
+    # connections to a container's own cluster IP, so using
+    # cluster.container_ips[0] for nnodes == 1 makes the c10d TCPStore
+    # time out.
+    os.environ["MASTER_ADDR"] = cluster.container_ips[0] if nnodes > 1 else "127.0.0.1"
     os.environ["MASTER_PORT"] = "29500"
 
     # One host ID per physical node, inherited by its eight children.
@@ -66,7 +77,6 @@ def profile_wrapper(config):
 
     profile_config = config.get("profile", {})
     profile_enabled = profile_config.get("enabled", False)
-    general = config["general"]
     with tempfile.TemporaryDirectory(prefix="pipeline-training-") as directory:
         config_path = Path(directory) / "config.json"
         config_path.write_text(json.dumps(config), encoding="utf-8")
@@ -99,17 +109,21 @@ def _build_torchrun_command(config_path, cluster_rank, world_size, gpu_per_node,
         raise ValueError("node rank must be in [0, n_workers / gpu_per_node)")
     if nnodes > 1 and not os.environ.get("MASTER_ADDR"):
         raise ValueError("MASTER_ADDR must be set for multi-node training")
+    master_addr = os.environ.get("MASTER_ADDR", "127.0.0.1")
+    master_port = os.environ.get("MASTER_PORT", "29500")
+    # Bracket only IPv6 addresses in the rendezvous endpoint.
+    rdzv_host = f"[{master_addr}]" if ":" in master_addr else master_addr
     return [
         sys.executable, "-m", "torch.distributed.run",
         f"--nnodes={nnodes}",
         f"--nproc-per-node={gpu_per_node}",
         f"--node-rank={cluster_rank}",
-        f"--master-addr={os.environ.get('MASTER_ADDR', '127.0.0.1')}",
-        f"--master-port={os.environ.get('MASTER_PORT', '29500')}",
+        f"--master-addr={master_addr}",
+        f"--master-port={master_port}",
         f"--max-restarts={max_restarts}",
         "--monitor-interval=1",
         "--rdzv-backend=c10d",
-        f"--rdzv-endpoint=[{os.environ.get('MASTER_ADDR', '127.0.0.1')}]:{os.environ.get('MASTER_PORT', '29500')}",
+        f"--rdzv-endpoint={rdzv_host}:{master_port}",
         f"--rdzv-id={os.environ.get('NCCL_HOSTID', 'pipeline').rsplit('-node-', 1)[0]}",
         "--module", "distributed_parallel_training_pipelined",
         "--config-path", str(config_path),
