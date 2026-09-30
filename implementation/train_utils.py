@@ -31,6 +31,22 @@ def load_dataset(path: str, vocab_size: int | None = None, validate: bool = Fals
     return dataset
 
 
+def compile_model(model: nn.Module, expert_name_match: str = "expert") -> nn.Module:
+    """Compile MoE expert submodules separately, then the full model.
+
+    Expert modules (matched by name) are compiled first as self-contained
+    graphs: the grouped-GEMM expert FFN is a clean dense kernel with a
+    dynamic token dimension, while the surrounding routing code is
+    data-dependent and stays in eager as graph breaks inside the outer
+    compiled model.
+    """
+    for layer_name, submodule in model.named_modules():
+        if expert_name_match in layer_name:
+            submodule.compile()
+    model.compile()
+    return model
+
+
 def get_batch(
     tokens,
     batch_size,

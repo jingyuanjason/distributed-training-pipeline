@@ -102,7 +102,7 @@ def wait_prefetched_weight_backward(works):
 
 class FSDPWrapperPipelined(nn.Module):
 
-    def __init__(self, module: nn.Module, FSDP_communication_group: dist.ProcessGroup=None, compute_dtype: torch.dtype = torch.float32, moe_compute_dtype: torch.dtype = torch.bfloat16, *, prefetch_weights: bool = True, compile_experts: bool = True):
+    def __init__(self, module: nn.Module, FSDP_communication_group: dist.ProcessGroup=None, compute_dtype: torch.dtype = torch.float32, moe_compute_dtype: torch.dtype = torch.bfloat16, *, prefetch_weights: bool = True):
         super().__init__()
         self.compute_dtype = compute_dtype
 
@@ -120,12 +120,7 @@ class FSDPWrapperPipelined(nn.Module):
         self.full_grad_accumulators = {}
         submodules_linear = []
         for layer_name, submodule in dict(module.named_modules()).items():
-            
-            if "expert" in layer_name:
-                if compile_experts:
-                    submodule.compile()
-                else:
-                    continue
+
             if isinstance(submodule, (LinearLayer, EmbeddingLayer)):
                 dist.broadcast(submodule.weight.data, dist.get_global_rank(FSDP_communication_group, 0), group=FSDP_communication_group)
                 assert submodule.weight.data.shape[0] % group_size == 0, (

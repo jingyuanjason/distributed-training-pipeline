@@ -302,9 +302,10 @@ class MultiHeadLayerLL(nn.Module):
             k = self.RoPE.forward(k, token_positions)
             q = self.RoPE.forward(q, token_positions)
         
-        if mask is None:
-            mask = (1 - torch.triu(torch.ones(size=(q.shape[-2], k.shape[-2]), device=x.device), diagonal=1)).bool().reshape([1] * (q.ndim - 2) + [q.shape[-2], k.shape[-2]])
-        res = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=True)
+        # Use the causal fast path by default; explicit masks retain their semantics.
+        res = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, attn_mask=mask, is_causal=mask is None, enable_gqa=True,
+        )
         res = rearrange(res, "... i j k ->... j (i k)")
         return self.output_proj(res)
 
