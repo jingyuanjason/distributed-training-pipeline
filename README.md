@@ -66,6 +66,15 @@ per experiment; multi-node workers must join the same rendezvous. Restart attemp
 are bounded, and node or launcher failures require external relaunch. Checkpoint
 publication does not protect against storage loss or corruption.
 
+## Recorded Results
+
+| GPU count | Model FLOPs utilization (MFU) | Throughput (tokens/s/GPU) |
+| --- | --- | --- |
+| 8 | 31.9% | 11,008 |
+| 32 | 24.5% | 8,584 |
+
+At a context length of **8,192 tokens**, the model FLOPs estimate is **65.2 GFLOPs**, calculated using only the **activated parameters** in the MoE model, rather than all expert parameters. MFU is calculated using the **NVIDIA B200 GPU's FP16 peak performance** as the hardware reference.
+
 ## Ongoing Work / Future Directions
 
 - **RL Training Integration** Trace collection from RL rollout workers
