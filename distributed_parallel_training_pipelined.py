@@ -102,6 +102,7 @@ def train(local_rank, cluster_rank, world_size, config):
     data_seed = config.get("data").get("seed", 42)
     validate_dataset = config.get("data").get("validate_dataset", False)
     validate_batches = config.get("data").get("validate_batches", False)
+    mock_data = config.get("data").get("mock_data", False)
     profile_config = config.get("profile", {})
     profile_enabled = profile_config.get("enabled", False)
     profile_warmup = int(profile_config.get("nsight_warmup", 5))
@@ -192,7 +193,7 @@ def train(local_rank, cluster_rank, world_size, config):
     )
 
     dist.barrier()
-    train_dataset = load_dataset(train_dataset_path, vocab_size=vocab_size, validate=validate_dataset)
+    train_dataset = None if mock_data else load_dataset(train_dataset_path, vocab_size=vocab_size, validate=validate_dataset)
     model = compile_model(model)
     if rank == info_src:
         print(f"training start time {train_start_time}", flush=True)
@@ -220,6 +221,7 @@ def train(local_rank, cluster_rank, world_size, config):
                         rng=data_rng,
                         vocab_size=vocab_size,
                         validate=validate_batches,
+                        mock_data=mock_data,
                     )
 
             x_spec = [batch_size // data_parallel_num, context_len, d_model]

@@ -1,0 +1,35 @@
+.git
+.venv
+**/__pycache__
+**/*.py[cod]
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.coverage
+htmlcov
+build
+dist
+**/*.egg-info
+.vscode
+.idea
+
+# Mount training data, checkpoints, and profiling outputs at runtime.
+data
+datasets
+checkpoints
+**/*.npy
+**/*.npz
+**/*.ckpt
+**/*.pt
+**/*.pth
+**/*.nsys-rep
+**/*.qdrep
+**/*.nsys-export
+**/*.sqlite
+
+# Do not bake local credentials into the image.
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+configs/data_source.yaml

@@ -57,42 +57,63 @@ def get_batch(
     rng: np.random.Generator | None = None,
     vocab_size: int | None = None,
     validate: bool = False,
+    mock_data: bool = False,
 ):
+    """Return input/next-token target tensors of shape (batch_size, context_length).
+
+    With mock_data=True, tokens may be None; random IDs in [0, vocab_size)
+    are generated using rng. serial_sampling and start_idx are ignored.
+    """
     if rng is None:
         rng = np.random.default_rng()
 
-    if tokens.ndim != 1:
-        raise ValueError(f"Expected a 1D token dataset, got shape {tokens.shape}")
-    if not np.issubdtype(tokens.dtype, np.integer):
-        raise TypeError(f"Expected an integer token dataset, got dtype {tokens.dtype}")
-    if tokens.size <= context_length:
-        raise ValueError(
-            f"Dataset length {tokens.size} must be greater than context_length {context_length}"
-        )
     if batch_size <= 0:
         raise ValueError(f"batch_size must be positive, got {batch_size}")
+    if context_length <= 0:
+        raise ValueError(f"context_length must be positive, got {context_length}")
 
-    if serial_sampling:
-        start_indices = np.arange(
-            start_idx,
-            min(start_idx + context_length * batch_size, tokens.size - context_length),
-            context_length,
+    if mock_data:
+        if vocab_size is None or vocab_size <= 0:
+            raise ValueError("vocab_size must be positive when mock_data=True")
+        sequences = rng.integers(
+            low=0,
+            high=vocab_size,
+            size=(batch_size, context_length + 1),
             dtype=np.int64,
         )
-        batch_size = len(start_indices)
+        train_data_np = sequences[:, :-1].copy()
+        train_target_np = sequences[:, 1:].copy()
     else:
-        start_indices = rng.integers(
-            low=start_idx,
-            high=tokens.size - context_length,
-            size=batch_size,
-            dtype=np.int64,
-        )
+        if tokens.ndim != 1:
+            raise ValueError(f"Expected a 1D token dataset, got shape {tokens.shape}")
+        if not np.issubdtype(tokens.dtype, np.integer):
+            raise TypeError(f"Expected an integer token dataset, got dtype {tokens.dtype}")
+        if tokens.size <= context_length:
+            raise ValueError(
+                f"Dataset length {tokens.size} must be greater than context_length {context_length}"
+            )
 
-    train_data_np = np.empty((batch_size, context_length), dtype=np.int64)
-    train_target_np = np.empty((batch_size, context_length), dtype=np.int64)
-    for i, start in enumerate(start_indices):
-        train_data_np[i] = tokens[start : start + context_length]
-        train_target_np[i] = tokens[start + 1 : start + context_length + 1]
+        if serial_sampling:
+            start_indices = np.arange(
+                start_idx,
+                min(start_idx + context_length * batch_size, tokens.size - context_length),
+                context_length,
+                dtype=np.int64,
+            )
+            batch_size = len(start_indices)
+        else:
+            start_indices = rng.integers(
+                low=start_idx,
+                high=tokens.size - context_length,
+                size=batch_size,
+                dtype=np.int64,
+            )
+
+        train_data_np = np.empty((batch_size, context_length), dtype=np.int64)
+        train_target_np = np.empty((batch_size, context_length), dtype=np.int64)
+        for i, start in enumerate(start_indices):
+            train_data_np[i] = tokens[start : start + context_length]
+            train_target_np[i] = tokens[start + 1 : start + context_length + 1]
 
     if validate:
         if vocab_size is None:
