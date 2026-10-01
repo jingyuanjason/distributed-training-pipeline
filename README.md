@@ -9,6 +9,7 @@ A distributed training implementation for a **BF16 Mixtral 8×7B MoE model**, in
 - **Expert Parallel (EP):** distributed experts and all-to-all token routing in [MoE layers](implementation/layers.py).
 - **Pipeline Parallel (PP):** microbatch scheduling and communication overlap in [pipeline training](pipeline/pipelined_train_overlap.py).
 - **Asynchronous training checkpoints:** improve distributed checkpoint saving (CPU Staging) and restoration for reliable training resumption.
+- **Kubernetes Support:** Run training job in kubernetes gpu cluster, with Kubeflow TrainJob
 
 ## Running the Project
 
