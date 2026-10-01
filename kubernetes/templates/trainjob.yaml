@@ -1,0 +1,45 @@
+{{- $resources := deepCopy .Values.resourcesPerNode -}}
+{{- $requests := default (dict) $resources.requests -}}
+{{- $limits := default (dict) $resources.limits -}}
+{{- $_ := set $requests "nvidia.com/gpu" .Values.gpusPerNode -}}
+{{- $_ := set $limits "nvidia.com/gpu" .Values.gpusPerNode -}}
+{{- $_ := set $resources "requests" $requests -}}
+{{- $_ := set $resources "limits" $limits -}}
+apiVersion: trainer.kubeflow.org/v1alpha1
+kind: TrainJob
+metadata:
+  name: {{ include "pipeline-training.name" . }}
+  namespace: {{ .Release.Namespace }}
+spec:
+  runtimeRef:
+    {{- toYaml .Values.runtimeRef | nindent 4 }}
+  podSpecOverrides:
+    - targetJobs:
+        - name: node
+      volumes:
+        - name: run-config
+          configMap:
+            name: {{ include "pipeline-training.name" . }}-config
+      containers:
+        - name: node
+          volumeMounts:
+            - name: run-config
+              mountPath: /app/configs/run_config.yaml
+              subPath: run_config.yaml
+              readOnly: true
+  trainer:
+    image: {{ required "image is required" .Values.image | quote }}
+    numNodes: {{ .Values.numNodes }}
+    numProcPerNode: {{ .Values.gpusPerNode }}
+    resourcesPerNode:
+      {{- toYaml $resources | nindent 6 }}
+    command: ["torchrun"]
+    args:
+      - {{ printf "--max-restarts=%v" .Values.runConfig.recovery.max_restarts | quote }}
+      - "--module"
+      - "distributed_parallel_training_pipelined"
+      - "--config-path"
+      - "/app/configs/run_config.yaml"
+    env:
+      - name: PYTHONUNBUFFERED
+        value: "1"

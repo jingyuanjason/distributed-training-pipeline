@@ -10,7 +10,7 @@ recovery:
   collective_timeout_seconds: 180
 data:
   vocab_size: 32000
-  mock_data: false # Generate random token batches without loading a dataset.
+  mock_data: True # Generate random token batches without loading a dataset.
   train_dataset_path: "/mnt/dataset/tiny_story/train_dataset.npy"
   valid_dataset_path: "/mnt/dataset/tiny_story/valid_dataset.npy"
   seed: 42

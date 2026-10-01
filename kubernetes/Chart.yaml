@@ -1,0 +1,6 @@
+apiVersion: v2
+name: pipeline-training
+description: Kubeflow TrainJob with a mounted training ConfigMap
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

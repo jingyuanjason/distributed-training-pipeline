@@ -20,14 +20,14 @@ source .venv/bin/activate
 python -m pip install -e .
 ```
 
-Edit [the run configuration](configs/run_config.yaml): set `data.train_dataset_path` to an existing 1D integer NumPy `.npy` token array (IDs in `[0, vocab_size)`, longer than `model.context_len`) and `general.checkpoint_folder` to a writable directory. adjust model and batch sizes to fit your GPU memory. Keep `data_parallel_num * pipeline_parallel_stages == n_workers` and `batch_size` divisible by `data_parallel_num * microbatch_num`.
+Edit [the run configuration](/home/jingyuan_li/pipeline_training/configs/run_config.yaml): set `data.train_dataset_path` to an existing 1D integer NumPy `.npy` token array (IDs in `[0, vocab_size)`, longer than `model.context_len`) and `general.checkpoint_folder` to a writable directory. adjust model and batch sizes to fit your GPU memory. Keep `data_parallel_num * pipeline_parallel_stages == n_workers` and `batch_size` divisible by `data_parallel_num * microbatch_num`.
 
 Launch the default single-node topology:
 
 ```bash
 torchrun --standalone --nnodes=1 --nproc-per-node=8 --max-restarts=3 \
   --module distributed_parallel_training_pipelined \
-  --config-path configs/run_config.yaml
+  --config-path /home/jingyuan_li/pipeline_training/configs/run_config.yaml
 ```
 
 The process count must match both `general.gpu_per_node` and `general.n_workers` for a single-node run.
@@ -35,13 +35,68 @@ The process count must match both `general.gpu_per_node` and `general.n_workers`
 **Modal alternative:** authenticate with `modal setup`, create/populate the `datasets` Modal Volume with tokens matching the configured path under `/mnt/dataset`, then run:
 
 ```bash
-modal run modal_wrapper.py --config-path configs/run_config.yaml
+modal run modal_wrapper.py --config-path /home/jingyuan_li/pipeline_training/configs/run_config.yaml
 ```
 
 The [Modal wrapper](modal_wrapper.py) currently requests one node with eight B300 GPUs. Keep its GPU request and cluster size consistent with the configuration. Leave `profile.enabled: false` for normal training; Modal profiling requires `nsys` in the training image.
 
 
 ## Docker / Kubeflow
+
+Deploy the Helm chart (requires Kubeflow Trainer v2, JobSet, the
+`torch-distributed` ClusterTrainingRuntime, and NVIDIA GPU support):
+
+```bash
+helm install pipeline-training /home/jingyuan_li/pipeline_training/kubernetes
+```
+
+Edit `runConfig` in `/home/jingyuan_li/pipeline_training/kubernetes/values.yaml`
+for Kubernetes runs. The chart defaults to one node with eight GPUs and retains
+the current image. Set `image`, `numNodes`, `gpusPerNode`, `runtimeRef`, and
+optional CPU/memory `resourcesPerNode` using Helm values or `--set`.
+Worker counts in the ConfigMap are derived from the node/GPU counts; DP/PP and
+batch settings must match. Review the existing chaos-engineering settings before
+production use: fault injection is enabled in the preserved defaults.
+
+The separate `/home/jingyuan_li/pipeline_training/configs/run_config.yaml`
+remains the local/Modal configuration; the two copies are not automatically
+synchronized. No image rebuild is required for config changes. The TrainJob
+mounts its `run_config.yaml` key read-only at `/app/configs/run_config.yaml`,
+overriding the image's config without rebuilding it. Both resources must be in
+the same namespace. This uses Kubeflow Trainer v2's `podSpecOverrides` API;
+check that your installed TrainJob CRD supports it.
+
+Resources are named `train-<release>` and `train-<release>-config`. For the release
+above they are `train-pipeline-training` and `train-pipeline-training-config`.
+The runtime must expose a replicated job and container named `node`.
+
+TrainJob fields may be immutable, and Helm upgrades do not automatically restart
+a training run. To change configuration, uninstall and reinstall the release
+(this stops workers and deletes the ConfigMap). A `subPath` mount does not receive
+live ConfigMap updates, and workers load configuration only at startup:
+
+```bash
+helm uninstall pipeline-training
+helm install pipeline-training /home/jingyuan_li/pipeline_training/kubernetes
+```
+
+If the earlier plain manifests were deployed, delete their TrainJob
+`pipeline-training` and ConfigMap `pipeline-training-config` before installing
+the chart to avoid running duplicate jobs. This chart still does not provide
+persistent checkpoint storage; pod replacement loses container-local files.
+
+For eight nodes with eight GPUs each, one matching topology is:
+
+```bash
+helm install pipeline-training /home/jingyuan_li/pipeline_training/kubernetes \
+  --set numNodes=8 \
+  --set runConfig.train.data_parallel_num=8 \
+  --set runConfig.train.pipeline_parallel_stages=8 \
+  --set runConfig.train.batch_size=256
+```
+
+Multi-node training requires extending the runtime with shared checkpoint storage
+supporting atomic rename. GPU memory fit depends on hardware and model settings.
 
 The base Dockerfile installs Python 3.12 and production dependencies from `uv.lock`.
 The training Dockerfile inherits that image, then copies and installs the project
