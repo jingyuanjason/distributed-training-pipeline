@@ -41,6 +41,30 @@ The current Kubernetes configuration in [values.yaml](/home/jingyuan_li/pipeline
 - **Asynchronous training checkpoints:** improve distributed checkpoint saving (CPU Staging) and restoration for reliable training resumption.
 - **Kubernetes Support:** Run training job in kubernetes gpu cluster, with Kubeflow TrainJob
 
+## Topology
+
+The current multi-node topology is designed to match the communication characteristics of each parallelism strategy with the available hardware interconnect:
+
+- **Intra-node: Data Parallel (DP) and Expert Parallel (EP)** groups are placed **within the same node**, where high-speed NVLink is available. Both DP (gradient synchronization) and EP (all-to-all token routing) are bandwidth-intensive, so they benefit from NVLink's high intra-node bandwidth.
+- **Inter-node: Pipeline Parallel (PP)** stages are placed **across different nodes**, since PP communication is limited to sending activations forward and gradients backward between adjacent stages—point-to-point transfers that are small enough to tolerate slower inter-node networking.
+
+## Recovery
+
+1. **Discover:** On startup, one rank selects the latest committed checkpoint and
+   broadcasts its path to all ranks, ignoring incomplete saves. Without a committed
+   checkpoint, training starts from scratch.
+2. **Restore:** All ranks reload model, optimizer, iteration/LR schedule, and
+   sampling and Torch/Python RNG states. Checkpoints missing RNG state are rejected.
+3. **Restart:** If a rank fails, the launcher recreates the entire worker group,
+   which resumes from the latest committed step. An explicitly selected checkpoint
+   sets the initial restore point; retries advance within that same run.
+
+Recovery requires unchanged topology, model, dataset, and training settings, plus
+shared checkpoint storage with atomic rename. Keep checkpoint directories separate
+per experiment; multi-node workers must join the same rendezvous. Restart attempts
+are bounded, and node or launcher failures require external relaunch. Checkpoint
+publication does not protect against storage loss or corruption.
+
 ## Running the Project
 
 Use Python 3.12 or 3.13 on Linux with CUDA/NCCL and BF16-capable NVIDIA GPUs. Run the following commands from the repository root:
@@ -121,40 +145,6 @@ checkpoints are lost when pods are replaced.
 
 Local/Modal runs still use the separate
 `/home/jingyuan_li/pipeline_training/configs/run_config.yaml`.
-
-## Topology
-
-The current multi-node topology is designed to match the communication characteristics of each parallelism strategy with the available hardware interconnect:
-
-- **Intra-node: Data Parallel (DP) and Expert Parallel (EP)** groups are placed **within the same node**, where high-speed NVLink is available. Both DP (gradient synchronization) and EP (all-to-all token routing) are bandwidth-intensive, so they benefit from NVLink's high intra-node bandwidth.
-- **Inter-node: Pipeline Parallel (PP)** stages are placed **across different nodes**, since PP communication is limited to sending activations forward and gradients backward between adjacent stages—point-to-point transfers that are small enough to tolerate slower inter-node networking.
-
-
-## Recovery
-
-1. **Discover:** On startup, one rank selects the latest committed checkpoint and
-   broadcasts its path to all ranks, ignoring incomplete saves. Without a committed
-   checkpoint, training starts from scratch.
-2. **Restore:** All ranks reload model, optimizer, iteration/LR schedule, and
-   sampling and Torch/Python RNG states. Checkpoints missing RNG state are rejected.
-3. **Restart:** If a rank fails, the launcher recreates the entire worker group,
-   which resumes from the latest committed step. An explicitly selected checkpoint
-   sets the initial restore point; retries advance within that same run.
-
-Recovery requires unchanged topology, model, dataset, and training settings, plus
-shared checkpoint storage with atomic rename. Keep checkpoint directories separate
-per experiment; multi-node workers must join the same rendezvous. Restart attempts
-are bounded, and node or launcher failures require external relaunch. Checkpoint
-publication does not protect against storage loss or corruption.
-
-## Recorded Results
-
-| GPU count | Model FLOPs utilization (MFU) | Throughput (tokens/s/GPU) |
-| --- | --- | --- |
-| 8 | 31.9% | 11,008 |
-| 32 | 24.5% | 8,584 |
-
-At a context length of **8,192 tokens**, the model FLOPs estimate is **65.2 GFLOPs**, calculated using only the **activated parameters** in the MoE model, rather than all expert parameters. MFU is calculated using the **NVIDIA B200 GPU's FP16 peak performance** as the hardware reference.
 
 ## Ongoing Work / Future Directions
 
