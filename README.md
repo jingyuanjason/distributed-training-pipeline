@@ -2,6 +2,15 @@
 
 A distributed training implementation for a **BF16 Mixtral 8×7B MoE model**, inspired by [Stanford CS336 LLM System Project](https://github.com/stanford-cs336/assignment2-systems) with substantial extensions.
 
+## Implementation
+- **Mixtral 8×7B-like BF16 MoE model:** a 32-layer decoder with eight SwiGLU experts per layer, top-2 token routing, and BF16 expert computation, combining grouped-query causal attention, RoPE, and RMSNorm.
+- **Fully Sharded Data Parallel (FSDP):** custom parameter sharding and gradient synchronization in [distributed wrappers](implementation/distributed/ddp_modules.py).
+- **Data Parallel (DP):** data distribution and multidimensional communication-group setup in [training orchestration](distributed_parallel_training_pipelined.py).
+- **Expert Parallel (EP):** distributed experts and all-to-all token routing in [MoE layers](implementation/layers.py).
+- **Pipeline Parallel (PP):** microbatch scheduling and communication overlap in [pipeline training](pipeline/pipelined_train_overlap.py).
+- **Asynchronous training checkpoints:** improve distributed checkpoint saving (CPU Staging) and restoration for reliable training resumption.
+- **Kubernetes Support:** Run training job in kubernetes gpu cluster, with Kubeflow TrainJob
+
 ## Results
 
 Training results for the 32-layer MoE model at a context length of **8,192 tokens** on NVIDIA B300 GPUs. Throughput is the total across all GPUs.
@@ -31,15 +40,6 @@ The current Kubernetes configuration in [values.yaml](/home/jingyuan_li/pipeline
 | Vocabulary size | 32,000 |
 | Context length | 8,192 tokens |
 | Token embeddings / LM head | Separate, untied weights |
-
-## Implementation
-- **Mixtral 8×7B-like BF16 MoE model:** a 32-layer decoder with eight SwiGLU experts per layer, top-2 token routing, and BF16 expert computation, combining grouped-query causal attention, RoPE, and RMSNorm.
-- **Fully Sharded Data Parallel (FSDP):** custom parameter sharding and gradient synchronization in [distributed wrappers](implementation/distributed/ddp_modules.py).
-- **Data Parallel (DP):** data distribution and multidimensional communication-group setup in [training orchestration](distributed_parallel_training_pipelined.py).
-- **Expert Parallel (EP):** distributed experts and all-to-all token routing in [MoE layers](implementation/layers.py).
-- **Pipeline Parallel (PP):** microbatch scheduling and communication overlap in [pipeline training](pipeline/pipelined_train_overlap.py).
-- **Asynchronous training checkpoints:** improve distributed checkpoint saving (CPU Staging) and restoration for reliable training resumption.
-- **Kubernetes Support:** Run training job in kubernetes gpu cluster, with Kubeflow TrainJob
 
 ## Topology
 
