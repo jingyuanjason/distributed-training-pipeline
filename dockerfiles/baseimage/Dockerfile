@@ -14,8 +14,12 @@ ENV PYTHONUNBUFFERED=1 \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
 # Keep a compiler available for TorchInductor/Triton runtime compilation.
+# NCCL IB transport needs the verbs library and hardware providers (including mlx5).
+# Include RDMA diagnostics; host drivers and devices are supplied by the cluster.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential ca-certificates libgomp1 \
+    && apt-get install -y --no-install-recommends \
+        build-essential ca-certificates libgomp1 \
+        libibverbs1 ibverbs-providers ibverbs-utils rdma-core \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=uv /uv /usr/local/bin/uv
