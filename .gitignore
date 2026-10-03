@@ -16,5 +16,7 @@ checkpoints/
 *.nsys-export
 *.sqlite
 
+
 # Local data source credentials
 configs/data_source.yaml
+kubernetes/scripts

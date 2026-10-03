@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-ARG BASE_IMAGE=cr.us-central1.nebius.cloud/u00cw5vmkjqsegxtgd/base-image:v1
+ARG BASE_IMAGE=cr.us-central1.nebius.cloud/u00cw5vmkjqsegxtgd/base-image:v2
 FROM ${BASE_IMAGE}
 
 WORKDIR /app

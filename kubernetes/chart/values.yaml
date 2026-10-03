@@ -44,7 +44,7 @@ runConfig:
     d_ff: 14336
     context_len: 8192
     num_layers: 8
-    num_expert_per_node: 2
+    num_expert_per_node: 4
   chaos_engineering:
     random_delay:
       enabled: True
