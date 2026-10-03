@@ -5,3 +5,5 @@
 3. Insufficient shared memory reserved for nccl communication
 4. RDMA Library Missing
 5. Insufficient Memory Lock for each process
+6. missing nvidia network opeartor for rdma communication
+7. pod address mismatch (when one pod crashes the other pods are not aware of communication address change)
