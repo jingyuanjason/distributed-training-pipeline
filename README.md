@@ -2,8 +2,38 @@
 
 A distributed training implementation for a **BF16 Mixtral 8×7B MoE model**, inspired by [Stanford CS336 LLM System Project](https://github.com/stanford-cs336/assignment2-systems) with substantial extensions.
 
-## Implementation
+## Results
 
+Training results for the 32-layer MoE model at a context length of **8,192 tokens** on NVIDIA B300 GPUs. Throughput is the total across all GPUs.
+
+| Batch size | Microbatches | GPU | GPU count | GFLOPs/token | Total throughput (tokens/s) | MFU (%) |
+| ---: | ---: | --- | ---: | ---: | ---: | ---: |
+| 128 | 32 | B300 | 8 | 84.01 | 68,714 | 32.1 |
+| 256 | 32 | B300 | 16 | 84.01 | 122,140 | 28.5 |
+| 512 | 32 | B300 | 32 | 84.01 | 225,978 | 26.4 |
+
+## Model Architecture
+
+The current Kubernetes configuration in [values.yaml](/home/jingyuan_li/pipeline_training/kubernetes/chart/values.yaml) defines a **32-layer, top-2 MoE decoder**. The effective architecture below reflects the [model implementation](/home/jingyuan_li/pipeline_training/implementation/layers.py), not just the configuration field names.
+
+| Setting | Effective value |
+| --- | --- |
+| Transformer layers | **32** = 8 layers per pipeline stage × 4 stages |
+| Hidden dimension (`d_model`) | 4,096 |
+| Expert intermediate dimension (`d_ff`) | 14,336 |
+| Query heads / KV heads | **32 / 8** — 4:1 grouped-query attention (GQA) |
+| Head dimension | 128 |
+| Attention | Causal scaled dot-product attention with RoPE |
+| Experts per layer | **8** = 2 local experts per rank × 4 ranks in the DP/EP group |
+| Active experts per token | **2**, selected by a learned router with renormalized top-2 weights |
+| Expert architecture | SwiGLU with three projections: gate, up, and down |
+| Normalization | Pre-RMSNorm in each transformer block; final RMSNorm before the LM head |
+| Vocabulary size | 32,000 |
+| Context length | 8,192 tokens |
+| Token embeddings / LM head | Separate, untied weights |
+
+## Implementation
+- **Mixtral 8×7B-like BF16 MoE model:** a 32-layer decoder with eight SwiGLU experts per layer, top-2 token routing, and BF16 expert computation, combining grouped-query causal attention, RoPE, and RMSNorm.
 - **Fully Sharded Data Parallel (FSDP):** custom parameter sharding and gradient synchronization in [distributed wrappers](implementation/distributed/ddp_modules.py).
 - **Data Parallel (DP):** data distribution and multidimensional communication-group setup in [training orchestration](distributed_parallel_training_pipelined.py).
 - **Expert Parallel (EP):** distributed experts and all-to-all token routing in [MoE layers](implementation/layers.py).
