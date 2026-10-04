@@ -17,9 +17,9 @@ Training results for the 32-layer MoE model at a context length of **8,192 token
 
 | Batch size | Microbatches | GPU | GPU count | GFLOPs/token | Total throughput (tokens/s) | MFU (%) |
 | ---: | ---: | --- | ---: | ---: | ---: | ---: |
-| 128 | 32 | B300 | 8 | 84.01 | 68,714 | 32.1 |
-| 256 | 32 | B300 | 16 | 84.01 | 122,140 | 28.5 |
-| 512 | 32 | B300 | 32 | 84.01 | 225,978 | 26.4 |
+| 128 | 32 | B300 | 8 | 84.01 | 75,076 | 35.0 |
+| 256 | 32 | B300 | 16 | 84.01 | 132,536 | 30.9 |
+| 512 | 32 | B300 | 32 | 84.01 | 241,060 | 28.1 |
 
 ## Model Architecture
 
