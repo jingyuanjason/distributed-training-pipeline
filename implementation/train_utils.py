@@ -33,10 +33,10 @@ def load_dataset(path: str, vocab_size: int | None = None, validate: bool = Fals
 
 def compile_model(model: nn.Module) -> nn.Module:
     """Compile selected compute-only layer types, keeping FSDP orchestration eager."""
-    from implementation.layers import GroupedPositionWiseFFLayer
+    from implementation.layers import GroupedPositionWiseFFLayer, ROPELayer, RMSNormLayer
 
     # Extend this tuple to opt additional compute-only layer types into compilation.
-    compiled_layer_types = (GroupedPositionWiseFFLayer,)
+    compiled_layer_types = (GroupedPositionWiseFFLayer, ROPELayer, RMSNormLayer)
     for submodule in model.modules():
         if isinstance(submodule, compiled_layer_types):
             submodule.compile()
