@@ -1,0 +1,62 @@
+{{- if and .Values.memlock.enabled .Values.memlock.createRuntime -}}
+{{- if or (ne .Values.runtimeRef.kind "ClusterTrainingRuntime") (ne .Values.runtimeRef.apiGroup "trainer.kubeflow.org") -}}
+{{- fail "memlock.createRuntime requires a trainer.kubeflow.org ClusterTrainingRuntime reference" -}}
+{{- end -}}
+{{- $runtimeName := required "runtimeRef.name is required when memlock.createRuntime is enabled" .Values.runtimeRef.name -}}
+{{- $existing := lookup "trainer.kubeflow.org/v1alpha1" "ClusterTrainingRuntime" "" $runtimeName -}}
+{{- if $existing -}}
+{{- $compatible := false -}}
+{{- range $job := $existing.spec.template.spec.replicatedJobs -}}
+{{- if eq $job.name "node" -}}
+{{- range $container := $job.template.spec.template.spec.containers -}}
+{{- if eq $container.name "node" -}}
+{{- $security := default dict $container.securityContext -}}
+{{- $capabilities := default dict $security.capabilities -}}
+{{- if or ($security.privileged | default false) (has "SYS_RESOURCE" ($capabilities.add | default list)) -}}
+{{- $compatible = true -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if not $compatible -}}
+{{- fail (printf "Existing ClusterTrainingRuntime %q must grant SYS_RESOURCE to the node job's node container for the memlock launcher. Update it separately or choose a new runtimeRef.name; the chart will not replace a shared runtime." $runtimeName) -}}
+{{- end -}}
+{{- else }}
+apiVersion: trainer.kubeflow.org/v1alpha1
+kind: ClusterTrainingRuntime
+metadata:
+  name: {{ $runtimeName | quote }}
+  labels:
+    trainer.kubeflow.org/framework: torch
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-10"
+    helm.sh/resource-policy: keep
+spec:
+  mlPolicy:
+    numNodes: 1
+    torch:
+      numProcPerNode: auto
+  template:
+    spec:
+      replicatedJobs:
+        - name: node
+          groupName: default
+          replicas: 1
+          template:
+            metadata:
+              labels:
+                trainer.kubeflow.org/trainjob-ancestor-step: trainer
+            spec:
+              template:
+                spec:
+                  containers:
+                    - name: node
+                      image: {{ .Values.image | quote }}
+                      securityContext:
+                        capabilities:
+                          add:
+                            - SYS_RESOURCE
+{{- end }}
+{{- end }}
