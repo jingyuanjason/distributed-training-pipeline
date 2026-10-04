@@ -125,7 +125,22 @@ class MoELayerMulti(nn.Module):
         logits = self.router(x)
         routing_res: torch.Tensor = softmax(logits, dim_sum=-1)
         probs, expert_idx = routing_res.topk(self.k, dim=-1)
+        (expert_input, expert_inputs_offset, expert_split_sizes,
+         recv_splits, assignment_order, probs, aux_loss) = self._dispatch_tokens(
+            x, logits, probs, expert_idx, return_aux_loss,
+        )
+        expert_outputs = self.experts(expert_input, expert_inputs_offset)
+        out = self._combine_tokens(
+            expert_outputs, expert_split_sizes, recv_splits, assignment_order,
+            probs, batch_size, context_len, input_dtype,
+        )
+        return (out, aux_loss) if return_aux_loss else out
+
+    @torch.compiler.disable
+    def _dispatch_tokens(self, x, logits, probs, expert_idx, return_aux_loss):
+        """Route tokens and prepare grouped expert inputs outside compilation."""
         probs = probs/probs.sum(dim=-1, keepdim=True)
+        aux_loss = None
         if return_aux_loss:
             experts = self.world_size * self.num_expert_per_node
             counts = torch.bincount(expert_idx.flatten(), minlength=experts).float()
@@ -135,9 +150,7 @@ class MoELayerMulti(nn.Module):
             mean_probs = logits.float().softmax(-1).sum(0) * (self.world_size * self.k / assignments)
             aux_loss = experts * (counts / assignments * mean_probs).sum()
         expert_idx = rearrange(expert_idx, " ... c d -> ... (c d)")
-        out = torch.empty(expert_idx.shape[0], *x.shape[1:], dtype=x.dtype, device=x.device)
 
-   
         expert_indices = []
         split_sizes = []
         for j in range(self.world_size * self.num_expert_per_node):
@@ -169,7 +182,13 @@ class MoELayerMulti(nn.Module):
             expert_inputs_size, device=expert_input.device, dtype=torch.int32,
         ).cumsum(dim=0, dtype=torch.int32)
 
-        expert_outputs = self.experts(expert_input, expert_inputs_offset)
+        return (expert_input, expert_inputs_offset, expert_split_sizes,
+                recv_splits, assignment_order, probs, aux_loss)
+
+    @torch.compiler.disable
+    def _combine_tokens(self, expert_outputs, expert_split_sizes, recv_splits,
+                        assignment_order, probs, batch_size, context_len, input_dtype):
+        """Redistribute expert outputs and combine tokens outside compilation."""
         expert_outputs = torch.split(expert_outputs, expert_split_sizes)
         expert_outputs_rearranged = []
         for rank_idx in range(self.world_size):
@@ -182,12 +201,16 @@ class MoELayerMulti(nn.Module):
         else:
             recv_tensors, _ = TensorExchange.apply(sent_tensors, recv_splits, self.dp_group)
                 
+        out = torch.empty(
+            assignment_order.shape[0], *recv_tensors.shape[1:],
+            dtype=recv_tensors.dtype, device=recv_tensors.device,
+        )
         out[assignment_order, :] = recv_tensors
 
         out = rearrange(out, " ... (c d) e -> ... c d e", d=self.k)
         out = (out * probs.unsqueeze(dim=-1)).sum(dim=-2)
         out = rearrange(out, "(b c) ... -> b c ...", b = batch_size, c = context_len).to(input_dtype)
-        return (out, aux_loss) if return_aux_loss else out
+        return out
 
 class GroupedPositionWiseFFLayer(nn.Module):
     def __init__(self, num_experts:int, d_model: int, d_ff: int, device=None, dtype=None):
@@ -299,8 +322,8 @@ class MultiHeadLayerLL(nn.Module):
             if token_positions is None:
                 len_seq = x.shape[1]
                 token_positions = torch.arange(0, len_seq, device=x.device)
-            k = self.RoPE.forward(k, token_positions)
-            q = self.RoPE.forward(q, token_positions)
+            k = self.RoPE(k, token_positions)
+            q = self.RoPE(q, token_positions)
         
         # Use the causal fast path by default; explicit masks retain their semantics.
         res = torch.nn.functional.scaled_dot_product_attention(

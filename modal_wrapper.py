@@ -51,7 +51,7 @@ volume_checkpoints = modal.Volume.from_name("checkpoints", create_if_missing=Tru
 
 @app.function(
     image=image,
-    gpu="B300:8",
+    gpu="H200:8",
     volumes={"/mnt/dataset": volume_dataset, "/mnt/checkpoints": volume_checkpoints, "/mnt/profile-data": volume_profile},
     scaledown_window=10,
     timeout=60 * 60 * 12,

@@ -66,7 +66,7 @@ def pipelined_train_overlap(model, optimizer, x, x_label, x_spec: list[int], spl
         if not first_stage:
             x_in.requires_grad_(True)
         inputs.append(x_in)
-        x_out, auxiliary = model.forward(x_in, return_aux_loss=True) if router_aux_loss_coef else (model.forward(x_in), None)
+        x_out, auxiliary = model(x_in, return_aux_loss=True) if router_aux_loss_coef else (model(x_in), None)
         outputs.append((x_out, auxiliary))
         return x_out
 

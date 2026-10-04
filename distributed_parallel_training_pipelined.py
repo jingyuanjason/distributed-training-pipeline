@@ -275,6 +275,7 @@ def train(local_rank, cluster_rank, world_size, config):
                         f"({tokens_per_second:,.2f} tokens/s)",
                         flush=True,
                     )
+                if rank == dist.get_process_group_ranks(pp_group)[-1]:
                     print(f"Rank {rank} Loss from last {print_loss_interval} iterations is {loss_acc / print_loss_interval}", flush=True)
                     loss_acc = 0
                 interval_duration = 0.0
