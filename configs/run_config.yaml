@@ -19,7 +19,7 @@ data:
 model:
   num_head: 32
   d_model: 4096
-  d_ff: 8192
+  d_ff: 12288
   context_len: 8192
   num_layers: 8
   num_expert_per_node: 4
