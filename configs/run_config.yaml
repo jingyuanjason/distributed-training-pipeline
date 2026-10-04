@@ -10,19 +10,19 @@ recovery:
   collective_timeout_seconds: 180
 data:
   vocab_size: 32000
-  mock_data: True # Generate random token batches without loading a dataset.
+  mock_data: False # Generate random token batches without loading a dataset.
   train_dataset_path: "/mnt/dataset/tiny_story/train_dataset.npy"
   valid_dataset_path: "/mnt/dataset/tiny_story/valid_dataset.npy"
   seed: 42
   validate_dataset: false
   validate_batches: true
 model:
-  num_head: 8
-  d_model: 256
-  d_ff: 256
-  context_len: 256
-  num_layers: 2
-  num_expert_per_node: 2
+  num_head: 32
+  d_model: 4096
+  d_ff: 8192
+  context_len: 8192
+  num_layers: 8
+  num_expert_per_node: 4
 chaos_engineering:
   random_delay:
     enabled: True
@@ -59,7 +59,7 @@ train:
   data_parallel_num: 2
   pipeline_parallel_stages: 4
   microbatch_num: 32
-  batch_size: 128
+  batch_size: 64
   save_interval: 50
   target_iteration: 5000
   learning_rate: 0.0001

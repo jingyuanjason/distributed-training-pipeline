@@ -1,4 +1,4 @@
-image: cr.eu-west2.nebius.cloud/e04mzx6ptnzys47jqw/train-image-mock:v3
+image: cr.us-north1.nebius.cloud/u02f65jeyvg9k8310a/train-image-mock:v4
 numNodes: 1
 gpusPerNode: 8
 runtimeRef:
