@@ -78,10 +78,11 @@ runConfig:
     optimizer_step: True
     data_type: float32
   train:
-    data_parallel_num: 8
+    fsdp_parallel_num: 8
+    data_parallel_num: 1 # DDP replica count, not the combined data-parallel size.
     pipeline_parallel_stages: 4
     microbatch_num: 32
-    batch_size: 512
+    batch_size: 512 # Must be divisible by FSDP * DDP * microbatch_num.
     save_interval: 50
     target_iteration: 5000
     learning_rate: 0.0001
