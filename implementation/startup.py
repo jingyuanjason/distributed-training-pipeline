@@ -1,6 +1,6 @@
 """Portable configuration loading and fail-fast single-node checks."""
-from pathlib import Path
 import math
+from pathlib import Path
 
 import numpy as np
 import yaml
@@ -23,6 +23,35 @@ def load_config(path):
     return config
 
 
+def parallel_sizes(train):
+    """Return FSDP and DDP sizes, preserving legacy FSDP-only configs."""
+    if "fsdp_parallel_num" not in train:
+        sizes = (train["data_parallel_num"], 1)
+    else:
+        sizes = (train["fsdp_parallel_num"], train["data_parallel_num"])
+    if any(type(size) is not int or size < 1 for size in sizes):
+        raise ValueError("FSDP and DDP sizes must be positive integers")
+    return sizes
+
+
+def parallel_rank_groups(train, world_size, local_world_size):
+    """Node-local stage blocks in [pipeline, replica, shard] rank order."""
+    fsdp, ddp = parallel_sizes(train)
+    pp = train["pipeline_parallel_stages"]
+    if type(pp) is not int or pp < 1 or world_size != pp * fsdp * ddp:
+        raise ValueError("fsdp_parallel_num * data_parallel_num * pipeline_parallel_stages must equal world size")
+    width = fsdp * ddp
+    if local_world_size < 1 or world_size % local_world_size or local_world_size % width:
+        raise ValueError("FSDP * DDP must divide gpu_per_node to keep each stage block node-local")
+    stage_groups = [list(range(start, start + width)) for start in range(0, world_size, width)]
+    return {
+        "fsdp": [stage[start:start + fsdp] for stage in stage_groups for start in range(0, width, fsdp)],
+        "ddp": [stage[shard::fsdp] for stage in stage_groups for shard in range(fsdp)],
+        "data": stage_groups,
+        "pp": [list(range(offset, world_size, width)) for offset in range(width)],
+    }
+
+
 def validate_config(config, *, check_data=False, check_cuda=False):
     general, train, model, data = (config[key] for key in ("general", "train", "model", "data"))
     validate_router_aux_loss_coef(train.get("router_aux_loss_coef", 0.01))
@@ -34,15 +63,15 @@ def validate_config(config, *, check_data=False, check_cuda=False):
         for key in keys:
             if type(section[key]) is not int or section[key] < 1:
                 raise ValueError(f"{key} must be a positive integer")
-    dp = train["data_parallel_num"]
+    fsdp, ddp = parallel_sizes(train)
+    dp = fsdp * ddp
     if general["device"] != "gpu":
         raise ValueError("Training requires CUDA/NCCL; general.device must be gpu")
     if general["n_workers"] != general["gpu_per_node"]:
         raise ValueError("The bundled launchers support one node only")
-    if dp * train["pipeline_parallel_stages"] != general["n_workers"]:
-        raise ValueError("data_parallel_num * pipeline_parallel_stages must equal n_workers")
+    parallel_rank_groups(train, general["n_workers"], general["gpu_per_node"])
     if train["batch_size"] % (dp * train["microbatch_num"]):
-        raise ValueError("batch_size must be divisible by data_parallel_num * microbatch_num")
+        raise ValueError("batch_size must be divisible by FSDP * DDP * microbatch_num")
     if not 0 <= general["info_src"] < general["n_workers"]:
         raise ValueError("info_src must identify a worker")
     if model["d_model"] % model["num_head"]:
@@ -52,10 +81,10 @@ def validate_config(config, *, check_data=False, check_cuda=False):
         raise ValueError("Triton attention requires a power-of-two head dimension >= 16")
     if model["context_len"] % 16:
         raise ValueError("Use context_len divisible by the attention tile size (16)")
-    if model["num_expert_per_node"] * dp < 2:
+    if model["num_expert_per_node"] * fsdp < 2:
         raise ValueError("Top-2 MoE routing requires at least two experts")
-    if any(value % dp for value in (data["vocab_size"], model["d_model"], model["d_ff"])):
-        raise ValueError("vocab_size, d_model and d_ff must be divisible by data_parallel_num")
+    if any(value % fsdp for value in (data["vocab_size"], model["d_model"], model["d_ff"])):
+        raise ValueError("vocab_size, d_model and d_ff must be divisible by fsdp_parallel_num")
     scheduler = train["learning_rate_scheduler"]
     if not 0 <= scheduler["t_w"] < scheduler["t_c"]:
         raise ValueError("Scheduler requires 0 <= t_w < t_c")

@@ -102,7 +102,7 @@ def wait_prefetched_weight_backward(works):
 
 class FSDPWrapperPipelined(nn.Module):
 
-    def __init__(self, module: nn.Module, FSDP_communication_group: dist.ProcessGroup=None, compute_dtype: torch.dtype = torch.float32, moe_compute_dtype: torch.dtype = torch.bfloat16, *, prefetch_weights: bool = True):
+    def __init__(self, module: nn.Module, FSDP_communication_group: dist.ProcessGroup=None, DDP_communication_group: dist.ProcessGroup=None, compute_dtype: torch.dtype = torch.float32, moe_compute_dtype: torch.dtype = torch.bfloat16, *, prefetch_weights: bool = True):
         super().__init__()
         self.compute_dtype = compute_dtype
 
@@ -114,6 +114,7 @@ class FSDPWrapperPipelined(nn.Module):
         dp_idx = dist.get_rank(FSDP_communication_group)
         self.works = []
         self.FSDP_communication_group = FSDP_communication_group
+        self.DDP_communication_group = DDP_communication_group
         self.group_size = group_size
         self.sharded_params = []
         self.replicated_params = []
@@ -138,6 +139,15 @@ class FSDPWrapperPipelined(nn.Module):
                 dist.broadcast(submodule.weight.data, dist.get_global_rank(FSDP_communication_group, 0), group=FSDP_communication_group)
                 for params in submodule.parameters():
                     self.replicated_params.append(params)
+
+        # DDP groups must connect matching FSDP shard indices. Synchronize
+        # after sharding so replicas share initial weights without sending
+        # full linear/embedding weights across the replica group.
+        if DDP_communication_group is not None:
+            ddp_src = dist.get_global_rank(DDP_communication_group, 0)
+            for params in self.sharded_params + self.replicated_params:
+                dist.broadcast(params.data, ddp_src, group=DDP_communication_group)
+
         self.forward_prework = collections.deque()
         self.backward_prehook = collections.deque()
         num_layers = len(submodules_linear)
@@ -239,6 +249,7 @@ class FSDPWrapperPipelined(nn.Module):
                 async_op=True,
                 group=self.FSDP_communication_group,
             )
+
             works.append(work)
 
             pending.append((params, shard_grad, reduce_input))
@@ -253,11 +264,28 @@ class FSDPWrapperPipelined(nn.Module):
                 async_op=True,
                 group=self.FSDP_communication_group,
             )
+
             works.append(work)
             pending.append((params, full_grad, full_grad))
 
         for work in works:
             work.wait()
+
+        # Complete FSDP synchronization before reducing corresponding shards
+        # across replicas, in the same parameter order on every rank.
+        ddp_works = []
+        if self.DDP_communication_group is not None:
+            for _, reduced_grad, _collective_input in pending:
+                ddp_works.append(dist.all_reduce(
+                    reduced_grad,
+                    op=dist.ReduceOp.AVG,
+                    async_op=True,
+                    group=self.DDP_communication_group,
+                ))
+
+        for work in ddp_works:
+            work.wait()
+
         for params, reduced_grad, _collective_input in pending:
             params.grad = reduced_grad
 

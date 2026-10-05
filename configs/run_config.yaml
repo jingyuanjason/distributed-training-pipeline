@@ -40,6 +40,14 @@ chaos_engineering:
     num_workers: 4
     duration: 10
     chance: 0.01
+experiment:
+  # Standalone run_experiment.py settings; edit module_wrapper there for your module.
+  device: "cuda:0"
+  dtype: float16
+  input_shapes: [[4, 4096, 4096]] # Example input; wrapper can build custom inputs.
+  warmup: 10
+  iterations: 20
+  mode: training # training: forward + backward; evaluation: forward with torch.no_grad().
 profile:
   # Bound Nsight capture after warmup; set enabled: false for normal training.
   enabled: false
@@ -56,10 +64,14 @@ profile:
   optimizer_step: True
   data_type: float32
 train:
-  data_parallel_num: 2
+  # World size = FSDP * DDP * PP; FSDP * DDP must divide gpu_per_node.
+  # Example: FSDP=2, DDP=4, PP=1 uses all 8 GPUs on one node.
+  # MoE routing stays within FSDP. DDP connects matching shards.
+  fsdp_parallel_num: 2
+  data_parallel_num: 1 # DDP replica count (not the combined data-parallel size).
   pipeline_parallel_stages: 4
   microbatch_num: 32
-  batch_size: 64
+  batch_size: 64 # Must be divisible by FSDP * DDP * microbatch_num.
   save_interval: 50
   target_iteration: 5000
   learning_rate: 0.0001

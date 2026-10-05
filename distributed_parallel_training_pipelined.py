@@ -16,6 +16,7 @@ from implementation.nnfunctions import cross_entropy, learning_rate_schedule_wra
 from implementation.optimizer import AdamW
 from implementation.train_utils import compile_model, get_batch, load_checkpoint_async_dist, load_dataset, save_checkpoint_async_dist
 from datetime import datetime, timedelta
+from implementation.startup import parallel_sizes, parallel_rank_groups
 
 
 
@@ -40,18 +41,20 @@ def _select_checkpoint(config, rank, info_src):
     if rank == info_src:
         try:
             settings = config["train"]
+            fsdp_size, ddp_size = parallel_sizes(settings)
+            data_parallel_size = fsdp_size * ddp_size
             load_checkpoint_path = settings.get("load_checkpoint_path")
             root = Path(config["general"]["checkpoint_folder"]) / "checkpoint"
             if load_checkpoint_path:
                 path = Path(load_checkpoint_path)
                 if int(os.environ.get("TORCHELASTIC_RESTART_COUNT", "0")):
-                    found = _latest_checkpoint(path.parent.parent, settings["data_parallel_num"], settings["pipeline_parallel_stages"], run=path.parent.name)
+                    found = _latest_checkpoint(path.parent.parent, data_parallel_size, settings["pipeline_parallel_stages"], run=path.parent.name)
                     if found is not None and found.parent == path.parent:
                         path = found
                 if not (path / "COMMITTED").is_file():
                     raise ValueError(f"Checkpoint is not committed: {path}")
             else:
-                path = _latest_checkpoint(root, settings["data_parallel_num"], settings["pipeline_parallel_stages"])
+                path = _latest_checkpoint(root, data_parallel_size, settings["pipeline_parallel_stages"])
             selection[0] = str(path) if path is not None else None
         except Exception as error:
             selection[1] = str(error)
@@ -87,6 +90,13 @@ def _verify_pending_checkpoints(pending, iteration, rank, info_src, device, drai
 
 def train(local_rank, cluster_rank, world_size, config):
     glob_rank = int(os.environ["RANK"])
+    rank_groups = parallel_rank_groups(config["train"], world_size, config["general"]["gpu_per_node"])
+    fsdp_size, ddp_size = parallel_sizes(config["train"])
+    data_parallel_size = fsdp_size * ddp_size
+    if config["train"]["microbatch_num"] < 1 or config["train"]["batch_size"] < 1 or config["train"]["batch_size"] % (data_parallel_size * config["train"]["microbatch_num"]):
+        raise ValueError("batch_size must be positive and divisible by FSDP * DDP * microbatch_num")
+    if glob_rank % config["general"]["gpu_per_node"] != local_rank:
+        raise ValueError("Node-local topology requires contiguous torchrun ranks per node")
     torch.cuda.set_device(local_rank)
     collective_timeout = timedelta(seconds=config.get("recovery", {}).get("collective_timeout_seconds", 180))
     dist.init_process_group("nccl", init_method="env://", rank=glob_rank, world_size=world_size, device_id=torch.device("cuda", local_rank), timeout=collective_timeout)
@@ -117,7 +127,6 @@ def train(local_rank, cluster_rank, world_size, config):
     optimizer_config = config.get("train").get("optimizer")
     learning_rate_scheduler_config = config.get("train").get("learning_rate_scheduler")
     pipeline_parallel_stages = config.get("train").get("pipeline_parallel_stages")
-    data_parallel_num = config.get("train").get("data_parallel_num")
     microbatch_num = config.get("train").get("microbatch_num")
     num_expert_per_node = config.get("model").get("num_expert_per_node")
     fsdp_compute_dtype = torch.float16
@@ -133,22 +142,17 @@ def train(local_rank, cluster_rank, world_size, config):
         torch.backends.cudnn.allow_tf32 = True
     rank = glob_rank
 
-    assert pipeline_parallel_stages * data_parallel_num == world_size
-    pipeline_stage_this = rank // data_parallel_num
-    dp_idx = rank % data_parallel_num
-
-    dp_groups = [[start + i for i in range(data_parallel_num)] for start in range(0, world_size, data_parallel_num)]
-    pp_groups = [[start + i for start in range(0, world_size, data_parallel_num)] for i in range(data_parallel_num)]
-    dp_group = None
-    pp_group = None
-    for dp_group_ranks in dp_groups:
-        dp_group_created = dist.new_group(ranks=dp_group_ranks, timeout=collective_timeout)
-        if rank in dp_group_ranks:
-            dp_group = dp_group_created
-    for pp_group_ranks in pp_groups:
-        pp_group_created = dist.new_group(ranks=pp_group_ranks, timeout=collective_timeout)
-        if rank in pp_group_ranks:
-            pp_group = pp_group_created
+    pipeline_stage_this = rank // data_parallel_size
+    # Flattened data index is unique across replicas, for RNG and checkpoints.
+    dp_idx = rank % data_parallel_size
+    groups = {}
+    for name, group_ranks in rank_groups.items():
+        for ranks in group_ranks:
+            group = dist.new_group(ranks=ranks, timeout=collective_timeout)
+            if rank in ranks:
+                groups[name] = group
+    fsdp_group, ddp_group = groups["fsdp"], groups["ddp"]
+    data_group, pp_group = groups["data"], groups["pp"]
 
     checkpoint_folder = config.get("general").get("checkpoint_folder")
     info_src = config.get("general").get("info_src")
@@ -165,12 +169,12 @@ def train(local_rank, cluster_rank, world_size, config):
         pipeline_parallel_stages,
         num_expert_per_node=num_expert_per_node,
         d_ff=d_ff,
-        dp_group=dp_group,
+        dp_group=fsdp_group,
         moe_compute_dtype=moe_compute_dtype,
     )
     model.to(device)
     
-    model = FSDPWrapperPipelined(model, FSDP_communication_group=dp_group, compute_dtype=fsdp_compute_dtype, moe_compute_dtype=moe_compute_dtype)
+    model = FSDPWrapperPipelined(model, FSDP_communication_group=fsdp_group, DDP_communication_group=ddp_group if ddp_size > 1 else None, compute_dtype=fsdp_compute_dtype, moe_compute_dtype=moe_compute_dtype)
     optimizer = AdamW(model.parameters(), lr=learning_rate, betas=(optimizer_config["beta1"], optimizer_config["beta2"]), weight_decay=optimizer_config["lambda"])
 
     now = datetime.now()
@@ -197,7 +201,7 @@ def train(local_rank, cluster_rank, world_size, config):
     model = compile_model(model)
     if rank == info_src:
         print(f"training start time {train_start_time}", flush=True)
-    print(f"Rank {rank} Ready, batch size {batch_size}, in this rank, batch size is {batch_size // data_parallel_num}", flush=True)
+    print(f"Rank {rank} Ready, FSDP={fsdp_size}, DDP={ddp_size}, batch size {batch_size}, local batch size {batch_size // data_parallel_size}", flush=True)
     loss_acc = 0
     interval_duration = 0.0
     interval_tokens_processed = 0
@@ -215,7 +219,7 @@ def train(local_rank, cluster_rank, world_size, config):
                 if rank == first_rank or rank == last_rank:
                     train_data, train_target = get_batch(
                         train_dataset,
-                        batch_size // data_parallel_num,
+                        batch_size // data_parallel_size,
                         context_len,
                         device,
                         rng=data_rng,
@@ -224,7 +228,7 @@ def train(local_rank, cluster_rank, world_size, config):
                         mock_data=mock_data,
                     )
 
-            x_spec = [batch_size // data_parallel_num, context_len, d_model]
+            x_spec = [batch_size // data_parallel_size, context_len, d_model]
             with _nvtx_range("learning_rate_update"):
                 lr = lr_scheduler(iteration)
                 for param_group in optimizer.param_groups:
@@ -249,7 +253,7 @@ def train(local_rank, cluster_rank, world_size, config):
                     dtype=pipeline_dtype,
                     device=device,
                     pp_group=pp_group,
-                    dp_group=dp_group,
+                    dp_group=data_group,
                 )
             # Only block on the GPU when we are about to consume the timing
             # number (or profiling); per-interval timing stays accurate because

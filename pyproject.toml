@@ -14,7 +14,7 @@ requires = ["setuptools>=81"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["modal_wrapper", "distributed_parallel_training_pipelined"]
+py-modules = ["modal_wrapper", "distributed_parallel_training_pipelined", "run_experiment"]
 
 [tool.setuptools.packages.find]
 where = ["."]
