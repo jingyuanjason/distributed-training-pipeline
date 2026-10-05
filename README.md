@@ -4,8 +4,7 @@ A distributed training implementation for a **BF16 Mixtral 8×7B MoE model**, in
 
 ## Implementation
 - **Mixtral 8×7B-like BF16 MoE model:** a 32-layer decoder with eight SwiGLU experts per layer, top-2 token routing, and BF16 expert computation, combining grouped-query causal attention, RoPE, and RMSNorm.
-- **Fully Sharded Data Parallel (FSDP):** custom parameter sharding and gradient synchronization in [distributed wrappers](implementation/distributed/ddp_modules.py).
-- **Data Parallel (DP):** data distribution and multidimensional communication-group setup in [training orchestration](distributed_parallel_training_pipelined.py).
+- **Hybrid Data Parallel (FSDP + DDP):** hybrid data parallel support in [distributed wrappers](implementation/distributed/ddp_modules.py). Support DDP on top of FSDP that replicate the workload for gradient sync.
 - **Expert Parallel (EP):** distributed experts and all-to-all token routing in [MoE layers](implementation/layers.py).
 - **Pipeline Parallel (PP):** microbatch scheduling and communication overlap in [pipeline training](pipeline/pipelined_train_overlap.py).
 - **Asynchronous training checkpoints:** improve distributed checkpoint saving (CPU Staging) and restoration for reliable training resumption.
