@@ -14,11 +14,14 @@ A distributed training implementation for a **BF16 Mixtral 8×7B MoE model**, in
 
 Training results for the 32-layer MoE model at a context length of **8,192 tokens** on NVIDIA B300 GPUs. Throughput is the total across all GPUs.
 
-| Batch size | Microbatches | GPU | GPU count | GFLOPs/token | Total throughput (tokens/s) | MFU (%) |
-| ---: | ---: | --- | ---: | ---: | ---: | ---: |
-| 128 | 32 | B300 | 8 | 84.01 | 75,076 | 35.0 |
-| 256 | 32 | B300 | 16 | 84.01 | 132,536 | 30.9 |
-| 512 | 32 | B300 | 32 | 84.01 | 241,060 | 28.1 |
+| Batch size | Microbatches | GPU | GPU count | GFLOPs/token | Total throughput (tokens/s) | MFU (%) | PP | DP | FSDP | EP |
+| ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 128 | 32 | B300 | 8 | 84.01 | 75,076 | 35.0 | 4 | 1 | 2 | 2 | 
+| 256 | 32 | B300 | 16 | 84.01 | 147,121 | 34.3 | 4 | 2 | 2 | 2 | 
+| 512 | 32 | B300 | 32 | 84.01 | 292,864 | 34.2 | 4 | 4 | 2 | 2 | 
+| 256 | 32 | B300 | 16 | 84.01 | 132,536 | 30.9 | 4 | 1 | 4 | 4 | 
+| 512 | 32 | B300 | 32 | 84.01 | 241,060 | 28.1 | 4 | 1 | 8 | 8 | 
+
 
 ## Model Architecture
 
