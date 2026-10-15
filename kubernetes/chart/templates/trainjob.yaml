@@ -13,6 +13,13 @@ metadata:
 spec:
   runtimeRef:
     {{- toYaml .Values.runtimeRef | nindent 4 }}
+  {{- with .Values.failurePolicy }}
+  failurePolicy:
+    restartPolicy: {{ .restartPolicy | default "RestartJobSet" }}
+    {{- if .maxRestarts }}
+    maxRestarts: {{ .maxRestarts }}
+    {{- end }}
+  {{- end }}
   podTemplateOverrides:
     - targetJobs:
         - name: node
