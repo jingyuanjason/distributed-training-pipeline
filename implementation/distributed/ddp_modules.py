@@ -1,6 +1,6 @@
 from typing import Any, Type
 
-from implementation.layers import LinearLayer, RMSNormLayer, EmbeddingLayer
+from implementation.layers import GroupedPositionWiseFFLayer, LinearLayer, MoELayer, MultiHeadLayerLL, RMSNormLayer, EmbeddingLayer
 from einops import einsum, rearrange
 import torch
 import math
@@ -10,6 +10,7 @@ import torch.distributed as dist
 from implementation.nnfunctions import dot_product_att, silu, softmax
 from torch.optim import Optimizer
 import collections
+from collections import defaultdict
 from implementation.kernels.attention import FlashAttentionTritonFunc
 
 
@@ -98,6 +99,65 @@ def wait_prefetched_weight_backward(works):
         if works:
             works.popleft().wait()
     return hook
+
+
+class ParallelismWrapper(nn.Module):
+
+    def __init__(self, module: nn.Module, parallel_communication_groups: defaultdict= defaultdict(lambda :None), compute_dtype: torch.dtype = torch.float32, moe_compute_dtype: torch.dtype = torch.bfloat16, *, prefetch_weights: bool = True):
+        super().__init__()
+        self.compute_dtype = compute_dtype
+        self.parallel_communication_group = parallel_communication_groups
+        self.module = module
+        self.works = []
+        self.register_TP()
+        self.register_EP()
+
+
+    def register_TP(self):
+        module = self.module
+        for _, submodule in dict(module.named_modules()).items():
+            if isinstance(submodule, MultiHeadLayerLL):
+                submodule.register_tp(self.parallel_communication_group["TP"])
+
+    def register_EP(self):
+        module = self.module
+        for _, submodule in dict(module.named_modules()).items():
+            if isinstance(submodule, MoELayer):
+                submodule.register_ep(self.parallel_communication_group["EP"])
+
+    def sync_gradients(self):
+
+        if self.works:
+            raise RuntimeError(
+                "Gradient synchronization is already pending; call "
+                "finish_gradient_synchronization() before syncing again."
+            )
+        communication_group = self.parallel_communication_group["DP"]
+        for params in self.module.parameters():
+            if params.requires_grad and params.grad is not None:
+                self.works.append(dist.all_reduce(
+                    params.grad,
+                    op=dist.ReduceOp.AVG,
+                    async_op=True,
+                    group=communication_group,
+                ))
+
+    def forward(self, x, **kwargs):
+        return self.module(x, **kwargs)
+
+    def collect_moe_lb_loss(self):
+        module = self.module
+        moe_loss = 0.0
+        for _, submodule in dict(module.named_modules()).items():
+            if isinstance(submodule, MoELayer):
+                moe_loss += submodule.get_moe_loss()
+        return moe_loss
+
+    def finish_gradient_synchronization(self):
+        for work in self.works:
+            work.wait()
+        self.works.clear()
+
 
 
 class FSDPWrapperPipelined(nn.Module):

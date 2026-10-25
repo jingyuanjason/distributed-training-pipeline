@@ -1,10 +1,12 @@
 import os
 import copy
 import random
+from collections.abc import Mapping
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 from typing import IO, Any, BinaryIO
 from concurrent.futures import ThreadPoolExecutor
 
@@ -272,3 +274,65 @@ def _load_legacy_optimizer(saved_state, optimizer):
         offset += n
         param_groups.append(serialized_group)
     optimizer.load_state_dict({"state": state, "param_groups": param_groups})
+
+
+def create_communication_groups(shards: dict, priority=None):
+    names = ("TP", "EP", "FSDP", "PP", "DP")
+    if not isinstance(shards, Mapping):
+        raise ValueError("shards must map parallel dimensions to shard settings")
+    if set(shards) - set(names):
+        raise ValueError(f"Unknown parallel dimensions: {set(shards) - set(names)}")
+    order = list(names if priority is None else priority)
+    if len(order) != len(names) or set(order) != set(names):
+        raise ValueError("priority must contain TP, EP, FSDP, PP, DP exactly once")
+
+    sizes = {}
+    for name in names:
+        settings = shards.get(name, {})
+        if not isinstance(settings, Mapping):
+            raise ValueError(f"{name} settings must be a mapping containing shard")
+        size = settings.get("shard", 1)
+        if type(size) is not int or size < 1:
+            raise ValueError(f"{name}.shard must be a positive integer")
+        sizes[name] = size
+    share_ep = shards.get("EP", {}).get("use_tp_topology", False)
+    if type(share_ep) is not bool:
+        raise ValueError("EP.use_tp_topology must be a boolean")
+    if not dist.is_available() or not dist.is_initialized():
+        raise RuntimeError("Initialize torch.distributed before creating communication groups")
+
+    dimensions = [name for name in order if not (name == "EP" and share_ep)]
+    total = 1
+    for name in dimensions:
+        total *= sizes[name]
+    world_size = dist.get_world_size()
+    if total != world_size:
+        raise ValueError(
+            f"Independent shard sizes must multiply to world size {world_size}, got {total}"
+        )
+
+    rank = dist.get_rank()
+    local_groups = {}
+    local_group_ranks = {}
+    stride = 1
+    for name in dimensions:
+        size = sizes[name]
+        block_size = stride * size
+        for block_start in range(0, world_size, block_size):
+            for offset in range(stride):
+                ranks = [block_start + offset + index * stride for index in range(size)]
+                group = dist.new_group(ranks=ranks)
+                if rank in ranks:
+                    local_groups[name] = group
+                    local_group_ranks[name] = ranks
+        stride = block_size
+    if share_ep:
+        local_groups["EP"] = local_groups["TP"]
+        local_group_ranks["EP"] = local_group_ranks["TP"]
+    summary = "; ".join(
+        f"{name}={local_group_ranks[name]}"
+        + (" (shared with TP)" if name == "EP" and share_ep else "")
+        for name in order
+    )
+    print(f"[Rank {rank}] Communication groups: {summary}", flush=True)
+    return local_groups
