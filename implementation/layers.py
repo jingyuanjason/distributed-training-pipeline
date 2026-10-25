@@ -1,6 +1,7 @@
 """Pipeline model and shared layers used by distributed wrappers."""
 
 from einops import rearrange
+from itertools import accumulate
 import torch
 import math
 import torch.nn as nn
@@ -8,7 +9,7 @@ import torch.nn.functional as F
 from torch import einsum
 from implementation.nnfunctions import silu, softmax
 import torch.distributed as dist
-from implementation.kernels.attention import FlashAttentionTritonFunc
+from collections import defaultdict, deque
 
 
 class TensorExchange(torch.autograd.Function):
@@ -51,9 +52,52 @@ class TensorExchange(torch.autograd.Function):
         dist.all_to_all_single(d_sent, d_recv, input_split_sizes=output_splits_size, output_split_sizes=sent_splits_size, group=dp_group)
         return d_sent, None, None
 
+class MoETokenCollect(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, sent_tensors, split_sizes: torch.Tensor, ep_group: dist.ProcessGroup = None):
+        dtype = sent_tensors.dtype
+        device = sent_tensors.device
+
+        # limitation: nccl only behavior, for gool the input shape has to be the same for different ranks
+        if ep_group is not None:
+            recv_buffer = [torch.empty(split_size, *tuple(sent_tensors.shape[1:]), dtype=dtype, device=device) for split_size in split_sizes]
+            print([buf.size() for buf in recv_buffer])
+            print(sent_tensors.size())
+            dist.all_gather(recv_buffer, sent_tensors, group=ep_group)
+        else:
+            recv_buffer = [sent_tensors]
+        ctx.split_sizes = split_sizes
+        ctx.ep_group = ep_group
+        return torch.cat(recv_buffer, dim=0)
+
+    def backward(ctx, d_recv, *_):
+        size_csum = torch.cumsum(ctx.split_sizes, dim=0)
+        start_idx = 0
+        if ctx.ep_group is not None:
+            ep_rank_this = dist.get_group_rank(ctx.ep_group, dist.get_rank())
+        else:
+            ep_rank_this = 0
+        if ep_rank_this != 0:
+            start_idx = size_csum[ep_rank_this-1]
+        end_idx = size_csum[ep_rank_this]
+        return d_recv[start_idx:end_idx], None, None
+
+
+class ActivationSync(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, communication_group: dist.ProcessGroup = None):
+
+        dist.all_reduce(x, group=communication_group)
+        ctx.communication_group = communication_group
+        return x
+
+    def backward(ctx, d_recv, *_):
+        dist.all_reduce(d_recv, group=ctx.communication_group)
+        return d_recv
+
 
 class LinearLayer(nn.Module):
-    def __init__(self, d_in, d_out, device=None, dtype=None):
+    def __init__(self, d_in, d_out, device=None, dtype=None, communication_groups: defaultdict = defaultdict(lambda: None)):
         super().__init__()
         self.d_in = d_in
         self.d_out = d_out
@@ -70,7 +114,7 @@ class LinearLayer(nn.Module):
 
 
 class EmbeddingLayer(nn.Module):
-    def __init__(self,  num_embeddings, embedding_dim, device=None, dtype=None):
+    def __init__(self,  num_embeddings, embedding_dim, device=None, dtype=None, communication_groups: defaultdict = defaultdict(lambda: None)):
         super().__init__()
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
@@ -82,7 +126,7 @@ class EmbeddingLayer(nn.Module):
         return self.weight[x,:]
     
 class RMSNormLayer(nn.Module):
-    def __init__(self, d_model: int, eps: float = 1e-5, device=None, dtype=None):
+    def __init__(self, d_model: int, eps: float = 1e-5, device=None, dtype=None, communication_groups: defaultdict = defaultdict(lambda: None)):
         super().__init__()
         self.d_model = d_model
         self.eps = eps
@@ -97,16 +141,18 @@ class RMSNormLayer(nn.Module):
         return (normalized * self.weight.float()).to(input_dtype)
 
 
-class MoELayerMulti(nn.Module):
-    def __init__(self, d_model: int, d_ff: int, k = 2, num_expert_per_node = 4, device=None, dtype=torch.bfloat16, dp_group: dist.ProcessGroup = None):
+class MoELayerMultiSharedInput(nn.Module):
+    # Assume EP rank shares input, e.g. in the case of TP
+    def __init__(self, d_model: int, d_ff: int, k = 2, num_expert_per_node = 4, device=None, dtype=torch.bfloat16, loss_global_count: bool= False, communication_groups: defaultdict = defaultdict(lambda: None)):
         super().__init__()
         self.device = device
         self.dtype = dtype
-        self.dp_group = dp_group
-        if dp_group is None:
+        self.communication_groups = communication_groups
+        self.ep_group = communication_groups.get("EP")
+        if self.ep_group is None:
             self.world_size = 1
         else:
-            self.world_size = dp_group.size()
+            self.world_size = self.ep_group.size()
         if num_expert_per_node < 1 or not 1 <= k <= self.world_size * num_expert_per_node:
             raise ValueError("Require positive expert count and 1 <= k <= total experts")
         if dtype != torch.bfloat16:
@@ -115,8 +161,121 @@ class MoELayerMulti(nn.Module):
         self.num_expert_per_node = num_expert_per_node
         self.experts = GroupedPositionWiseFFLayer(num_expert_per_node, d_model, d_ff, device=device, dtype=dtype)
         self.router = LinearLayer(d_model, self.world_size * num_expert_per_node, device=device, dtype=dtype)
+        self.loss_global_count = loss_global_count
+        self.loss_material_queue = deque() # record the material for calculating loss, use queue for pipeline parallel microbatch handling
+
     
-    def forward(self, x: torch.Tensor, return_aux_loss=False):
+    def forward(self, x: torch.Tensor):
+        # x B, S, D
+        input_dtype = x.dtype
+        x = x.to(self.dtype)
+        batch_size, context_len = x.shape[:2]
+        x = rearrange(x, "b c ... -> (b c) ...")
+        logits = self.router(x)
+        
+        routing_res: torch.Tensor = softmax(logits, dim_sum=-1)
+        probs, expert_idx = routing_res.topk(self.k, dim=-1)
+        
+        # ------------------------------------------------------------
+        probs = probs/probs.sum(dim=-1, keepdim=True)
+        expert_idx = rearrange(expert_idx, " ... c d -> ... (c d)")
+        async_op = self.record_moe_metadata(routing_res, expert_idx)
+
+        expert_indices = []
+        split_sizes = []
+
+        for i in range(self.world_size):
+            for j in range(self.num_expert_per_node):
+                expert_this = i * self.num_expert_per_node + j
+                indices = (expert_idx == expert_this).nonzero(as_tuple=True)[0]
+                split_sizes.append(len(indices))
+                expert_indices.append(indices)    
+        
+        assignment_order = torch.cat(expert_indices, dim=0)
+
+        split_sizes = torch.tensor(split_sizes, device=x.device, dtype=torch.int32)
+        split_sizes_by_rank = rearrange(split_sizes, "(a b) -> a b", b=self.num_expert_per_node).sum(dim=-1)
+        if self.ep_group is None:
+            ep_rank_this = 0
+        else:
+            ep_rank_this = dist.get_group_rank(self.communication_groups["EP"], dist.get_rank())
+        token_sizes_this_rank = split_sizes[ep_rank_this * self.num_expert_per_node:(ep_rank_this + 1) * self.num_expert_per_node]
+        token_indices_this_rank = expert_indices[ep_rank_this * self.num_expert_per_node:(ep_rank_this + 1) * self.num_expert_per_node]
+        assignment_order_this = torch.cat(token_indices_this_rank, dim=0)
+        expert_input_this = x[assignment_order_this // self.k, :]
+        
+        
+        expert_inputs_offset = torch.cumsum(token_sizes_this_rank, dim=0, dtype=torch.int32)
+
+        # --------------------------------------------------------------
+        
+        expert_outputs = self.experts(expert_input_this, expert_inputs_offset)
+
+
+
+        if async_op is not None:
+            async_op.wait()
+        # --------------------------------------------------------------
+
+        recv_tensors = MoETokenCollect.apply(expert_outputs, split_sizes_by_rank, self.ep_group)
+
+        out = torch.empty(
+            assignment_order.shape[0], *recv_tensors.shape[1:],
+            dtype=recv_tensors.dtype, device=recv_tensors.device,
+        )
+        out[assignment_order, :] = recv_tensors
+
+        out = rearrange(out, " ... (c d) e -> ... c d e", d=self.k)
+        out = (out * probs.unsqueeze(dim=-1)).sum(dim=-2)
+        out = rearrange(out, "(b c) ... -> b c ...", b = batch_size, c = context_len).to(input_dtype)
+        return out
+
+    def get_moe_loss(self):
+        if len(self.loss_material_queue) == 0:
+            return 0.0
+        prob_sum, counts = self.loss_material_queue.popleft()
+        experts = self.world_size * self.num_expert_per_node
+        assignments = counts.sum().clamp_min(1)
+        mean_probs = prob_sum * (self.world_size * self.k / assignments)
+        aux_loss = experts * (counts / assignments * mean_probs).sum()
+        return aux_loss
+
+    def record_moe_metadata(self, probs, expert_idx):
+        total_experts = self.world_size * self.num_expert_per_node
+        counts = torch.bincount(expert_idx.flatten(), minlength=total_experts).float()
+        prob_sum = probs.sum(dim=0) # num_experts
+        self.loss_material_queue.append((prob_sum, counts))
+        if self.loss_global_count:
+            async_op = dist.all_reduce(counts, group=self.ep_group, async_op=True)
+            return async_op
+        return None
+
+
+
+class MoELayerMulti(nn.Module):
+    def __init__(self, d_model: int, d_ff: int, k = 2, num_expert_per_node = 4, device=None, dtype=torch.bfloat16, loss_global_count: bool= False, communication_groups: defaultdict = defaultdict(lambda: None)):
+        super().__init__()
+        self.device = device
+        self.dtype = dtype
+        self.communication_groups = communication_groups
+        self.ep_group = communication_groups.get("EP")
+        if self.ep_group is None:
+            self.world_size = 1
+        else:
+            self.world_size = self.ep_group.size()
+        if num_expert_per_node < 1 or not 1 <= k <= self.world_size * num_expert_per_node:
+            raise ValueError("Require positive expert count and 1 <= k <= total experts")
+        if dtype != torch.bfloat16:
+            raise ValueError("Grouped MoE requires torch.bfloat16 compute dtype")
+        self.k = k
+        self.num_expert_per_node = num_expert_per_node
+        self.experts = GroupedPositionWiseFFLayer(num_expert_per_node, d_model, d_ff, device=device, dtype=dtype)
+        self.router = LinearLayer(d_model, self.world_size * num_expert_per_node, device=device, dtype=dtype)
+        self.loss_global_count = loss_global_count
+        self.loss_material_queue = deque() # record the material for calculating loss, use queue for pipeline parallel microbatch handling
+
+    
+    def forward(self, x: torch.Tensor):
         # x B, S, D
         input_dtype = x.dtype
         x = x.to(self.dtype)
@@ -125,30 +284,46 @@ class MoELayerMulti(nn.Module):
         logits = self.router(x)
         routing_res: torch.Tensor = softmax(logits, dim_sum=-1)
         probs, expert_idx = routing_res.topk(self.k, dim=-1)
+
         (expert_input, expert_inputs_offset, expert_split_sizes,
-         recv_splits, assignment_order, probs, aux_loss) = self._dispatch_tokens(
-            x, logits, probs, expert_idx, return_aux_loss,
+         recv_splits, assignment_order, probs) = self._dispatch_tokens(
+            x, logits, probs, expert_idx,
         )
+        async_op = self.record_moe_metadata(routing_res, expert_idx)
         expert_outputs = self.experts(expert_input, expert_inputs_offset)
+        if async_op is not None:
+            async_op.wait()
         out = self._combine_tokens(
             expert_outputs, expert_split_sizes, recv_splits, assignment_order,
             probs, batch_size, context_len, input_dtype,
         )
-        return (out, aux_loss) if return_aux_loss else out
+        return out
+
+    def get_moe_loss(self):
+        if len(self.loss_material_queue) == 0:
+            return 0.0
+        prob_sum, counts = self.loss_material_queue.popleft()
+        experts = self.world_size * self.num_expert_per_node
+        assignments = counts.sum().clamp_min(1)
+        mean_probs = prob_sum * (self.world_size * self.k / assignments)
+        aux_loss = experts * (counts / assignments * mean_probs).sum()
+        return aux_loss
+
+    def record_moe_metadata(self, probs, expert_idx):
+        total_experts = self.world_size * self.num_expert_per_node
+        counts = torch.bincount(expert_idx.flatten(), minlength=total_experts).float()
+        prob_sum = probs.sum(dim=0) # num_experts
+        self.loss_material_queue.append((prob_sum, counts))
+        if self.loss_global_count:
+            async_op = dist.all_reduce(counts, group=self.ep_group, async_op=True)
+            return async_op
+        return None
+
 
     @torch.compiler.disable
-    def _dispatch_tokens(self, x, logits, probs, expert_idx, return_aux_loss):
+    def _dispatch_tokens(self, x, probs, expert_idx):
         """Route tokens and prepare grouped expert inputs outside compilation."""
         probs = probs/probs.sum(dim=-1, keepdim=True)
-        aux_loss = None
-        if return_aux_loss:
-            experts = self.world_size * self.num_expert_per_node
-            counts = torch.bincount(expert_idx.flatten(), minlength=experts).float()
-            if self.world_size > 1:
-                dist.all_reduce(counts, group=self.dp_group)
-            assignments = counts.sum().clamp_min(1)
-            mean_probs = logits.float().softmax(-1).sum(0) * (self.world_size * self.k / assignments)
-            aux_loss = experts * (counts / assignments * mean_probs).sum()
         expert_idx = rearrange(expert_idx, " ... c d -> ... (c d)")
 
         expert_indices = []
@@ -162,11 +337,10 @@ class MoELayerMulti(nn.Module):
         assignment_order = torch.cat(expert_indices, dim=0)
         sent_tensor = x[assignment_order // self.k, :]
 
-
         if self.world_size == 1:
             recv_tensors, recv_splits = sent_tensor, split_sizes
         else:
-            recv_tensors, recv_splits = TensorExchange.apply(sent_tensor, split_sizes, self.dp_group)
+            recv_tensors, recv_splits = TensorExchange.apply(sent_tensor, split_sizes, self.ep_group)
 
         chunks = torch.split(recv_tensors, recv_splits, dim=0)
         expert_inputs = []
@@ -183,7 +357,7 @@ class MoELayerMulti(nn.Module):
         ).cumsum(dim=0, dtype=torch.int32)
 
         return (expert_input, expert_inputs_offset, expert_split_sizes,
-                recv_splits, assignment_order, probs, aux_loss)
+                recv_splits, assignment_order, probs)
 
     @torch.compiler.disable
     def _combine_tokens(self, expert_outputs, expert_split_sizes, recv_splits,
@@ -213,7 +387,7 @@ class MoELayerMulti(nn.Module):
         return out
 
 class GroupedPositionWiseFFLayer(nn.Module):
-    def __init__(self, num_experts:int, d_model: int, d_ff: int, device=None, dtype=None):
+    def __init__(self, num_experts:int, d_model: int, d_ff: int, device=None, dtype=None, communication_groups: defaultdict = defaultdict(lambda: None)):
         super().__init__()
         self.d_model = d_model
         self.dff = d_ff
@@ -221,52 +395,35 @@ class GroupedPositionWiseFFLayer(nn.Module):
         self.dtype = dtype
         self.num_experts = num_experts
         std_v = math.sqrt(2 / (d_model + d_ff))
-        self.w1 = nn.Parameter(nn.init.trunc_normal_(torch.empty((num_experts, d_ff, d_model), device=device, dtype=dtype), 0, std_v, -3 * std_v, 3 * std_v))
+        self.w1 = nn.Parameter(nn.init.trunc_normal_(torch.empty((num_experts, d_model, d_ff), device=device, dtype=dtype), 0, std_v, -3 * std_v, 3 * std_v))
         self.w2 = nn.Parameter(nn.init.trunc_normal_(torch.empty((num_experts, d_model, d_ff), device=device, dtype=dtype), 0, std_v, -3 * std_v, 3 * std_v))
         self.w3 = nn.Parameter(nn.init.trunc_normal_(torch.empty((num_experts, d_ff, d_model), device=device, dtype=dtype), 0, std_v, -3 * std_v, 3 * std_v))
+        self.communication_groups = communication_groups
+        
     
     def forward(self, x: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
         x1 = F.grouped_mm(
             x,
-            self.w1.to(x.dtype).transpose(-1, -2),
+            self.w1.to(x.dtype),
             offs=offsets,
         )
         x1 = silu(x1)
         x2 = F.grouped_mm(
             x,
-            self.w3.to(x.dtype).transpose(-1, -2),
+            self.w2.to(x.dtype),
             offs=offsets,
         )
         x1 = x1 * x2
         x_out = F.grouped_mm(
             x1,
-            self.w2.to(x.dtype).transpose(-1, -2),
+            self.w3.to(x.dtype),
             offs=offsets,
         )
         return x_out
-
-
-class PositionWiseFFLayer(nn.Module):
-    def __init__(self, d_model: int, d_ff: int, device=None, dtype=None):
-        super().__init__()
-        self.d_model = d_model
-        self.dff = d_ff
-        self.device = device
-        self.dtype = dtype
-     #   self.w1 = nn.Parameter(torch.nn.init.trunc_normal_(torch.Tensor(size=(self.dff, self.d_model), device=device), 0, 1, -3, 3))
-     #   self.w2 = nn.Parameter(torch.nn.init.trunc_normal_(torch.Tensor(size=(self.d_model, self.dff), device=device), 0, 1, -3, 3))
-     #   self.w3 = nn.Parameter(torch.nn.init.trunc_normal_(torch.Tensor(size=(self.dff, self.d_model), device=device), 0, 1, -3, 3))
-        self.w1 = LinearLayer(self.d_model, self.dff, device=device, dtype=dtype)
-        self.w2 = LinearLayer(self.dff, self.d_model, device=device, dtype=dtype)
-        self.w3 = LinearLayer(self.d_model, self.dff, device=device, dtype=dtype)
-      #  self.silu = SiLuLayer()
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.w2(silu(self.w1(x)) * self.w3(x))
     
     
 class ROPELayer(nn.Module):
-    def __init__(self, theta: float, d_k: int, max_seq_len: int, device=None):
+    def __init__(self, theta: float, d_k: int, max_seq_len: int, device=None, communication_groups: defaultdict = defaultdict(lambda: None)):
         super().__init__()
         self.theta = theta
         self.d_k = d_k
@@ -288,7 +445,7 @@ class ROPELayer(nn.Module):
     
     
 class MultiHeadLayerLL(nn.Module):
-    def __init__(self, d_model: int, num_heads: int, device=None, dtype=None, use_rope=True, RoPE: nn.Module = None):
+    def __init__(self, d_model: int, num_heads: int, device=None, dtype=None, use_rope=True, RoPE: nn.Module = None, communication_groups: defaultdict = defaultdict(lambda: None)):
         super().__init__()
         if d_model % num_heads != 0:
             raise ValueError(f"d_model ({d_model}) must be divisible by num_heads ({num_heads})")
@@ -311,6 +468,7 @@ class MultiHeadLayerLL(nn.Module):
                 self.RoPE = ROPELayer(10000, d_model//num_heads, 100000)
             else:
                 self.RoPE = RoPE
+        self.communication_groups = communication_groups
 
     def forward(self, x: torch.Tensor, token_positions: torch.Tensor = None, mask: torch.Tensor = None) -> torch.Tensor:
         # batch, seq_len, d_k
@@ -330,12 +488,13 @@ class MultiHeadLayerLL(nn.Module):
             q, k, v, attn_mask=mask, is_causal=mask is None, enable_gqa=True,
         )
         res = rearrange(res, "... i j k ->... j (i k)")
-        return self.output_proj(res)
+        x_out = self.output_proj(res)
+        return x_out
 
 
 class TransformerLayer(nn.Module):
 
-    def __init__(self, d_model, num_heads, d_ff, num_expert_per_node=1, RoPELayer = None, dp_group: dist.ProcessGroup = None, moe_compute_dtype=torch.bfloat16):
+    def __init__(self, d_model, num_heads, d_ff, num_expert_per_node=1, RoPELayer = None, communication_groups: defaultdict = defaultdict(lambda: None), moe_compute_dtype=torch.bfloat16):
         super().__init__()
         self.d_model = d_model
         self.num_heads = num_heads
@@ -344,21 +503,18 @@ class TransformerLayer(nn.Module):
         self.ln1 = RMSNormLayer(d_model)
         self.attn = MultiHeadLayerLL(d_model, num_heads, RoPE=RoPELayer)
         self.ln2 = RMSNormLayer(d_model)
-        # self.ffn = PositionWiseFFLayer(d_model, d_ff)
-        self.ffn = MoELayerMulti(d_model, d_ff, num_expert_per_node = num_expert_per_node, dp_group=dp_group, dtype=moe_compute_dtype)
+        self.ffn = MoELayerMulti(d_model, d_ff, num_expert_per_node = num_expert_per_node, communication_groups=communication_groups, dtype=moe_compute_dtype)
+        self.communication_groups = communication_groups
     
-    def forward(self, x, return_aux_loss=False):
-        x = x + self.attn(self.ln1(x))
-        if return_aux_loss:
-            out, aux_loss = self.ffn(self.ln2(x), return_aux_loss=True)
-            return x + out, aux_loss
-        x = x + self.ffn(self.ln2(x))
+    def forward(self, x):
+        x = x + ActivationSync.apply(self.attn(self.ln1(x)), self.communication_groups["TP"])
+        x = x + ActivationSync.apply(self.ffn(self.ln2(x)), self.communication_groups["TP"])
         return x
 
 
 class TransformerLM(nn.Module):
 
-    def __init__(self, vocab_size, context_length, d_model, num_layers, num_heads, num_expert_per_node=1, d_ff=None, theta=10000, dp_group: dist.ProcessGroup = None):
+    def __init__(self, vocab_size, context_length, d_model, num_layers, num_heads, num_expert_per_node=1, d_ff=None, theta=10000, communication_groups: defaultdict = defaultdict(lambda: None)):
         super().__init__()
         if d_ff == None:
             d_ff = math.ceil(d_model * (8/3)/64)*64
@@ -367,7 +523,7 @@ class TransformerLM(nn.Module):
         self.num_layers = num_layers
         self.token_embeddings = EmbeddingLayer(vocab_size, d_model)
         rope_layer = ROPELayer(theta, d_model//num_heads, context_length)
-        self.layers = nn.Sequential(*[TransformerLayer(d_model, num_heads, d_ff, num_expert_per_node=num_expert_per_node, RoPELayer=rope_layer, dp_group=dp_group) for i in range(num_layers)])
+        self.layers = nn.Sequential(*[TransformerLayer(d_model, num_heads, d_ff, num_expert_per_node=num_expert_per_node, RoPELayer=rope_layer, communication_groups=communication_groups) for i in range(num_layers)])
         self.ln_final = RMSNormLayer(d_model)
         self.lm_head = LinearLayer(d_model, vocab_size)
     
@@ -380,7 +536,7 @@ class TransformerLM(nn.Module):
 
 class TransformerLMPipelined(nn.Module):
 
-    def __init__(self, vocab_size, context_length, d_model, num_layers, num_heads, stage_this, stage_total, num_expert_per_node=1, d_ff=None, theta=10000, dp_group: dist.ProcessGroup = None, moe_compute_dtype=torch.bfloat16):
+    def __init__(self, vocab_size, context_length, d_model, num_layers, num_heads, stage_this, stage_total, num_expert_per_node=1, d_ff=None, theta=10000, communication_groups: defaultdict = defaultdict(lambda: None), moe_compute_dtype=torch.bfloat16):
         super().__init__()
         if d_ff == None:
             d_ff = math.ceil(d_model * (8/3)/64)*64
@@ -394,7 +550,7 @@ class TransformerLMPipelined(nn.Module):
         else:
             self.token_embeddings = None
         rope_layer = ROPELayer(theta, d_model//num_heads, context_length)
-        self.layers = nn.Sequential(*[TransformerLayer(d_model, num_heads, d_ff, num_expert_per_node=num_expert_per_node, RoPELayer=rope_layer, dp_group=dp_group, moe_compute_dtype=moe_compute_dtype) for i in range(num_layers)])
+        self.layers = nn.Sequential(*[TransformerLayer(d_model, num_heads, d_ff, num_expert_per_node=num_expert_per_node, RoPELayer=rope_layer, communication_groups=communication_groups, moe_compute_dtype=moe_compute_dtype) for i in range(num_layers)])
         if self.stage_this == self.stage_total - 1:
             self.ln_final = RMSNormLayer(d_model)
             self.lm_head = LinearLayer(d_model, vocab_size)
@@ -418,21 +574,3 @@ class TransformerLMPipelined(nn.Module):
         return (x, aux_loss) if return_aux_loss else x
 
 
-class Attention_Simple(nn.Module):
-
-    def __init__(self):
-        super().__init__()
-    
-    def forward(self, k, q, v, mask):
-        res = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask)
-        return res
-    
-class Attention_Flash(nn.Module):
-
-    def __init__(self):
-        super().__init__()
-    
-    def forward(self, k, q, v, mask):
-        res = FlashAttentionTritonFunc().apply(k, q, v)
-        return res
-    
