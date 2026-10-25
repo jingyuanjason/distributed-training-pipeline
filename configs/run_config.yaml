@@ -28,7 +28,7 @@ model:
     TP:
       shard: 1
     PP:
-      shard: 1
+      shard: 8
     EP:
       shard: 1
       use_tp_topology: True
@@ -39,7 +39,7 @@ train:
     FSDP:
       shard: 1
   microbatch_num: 32
-  global_batch_size: 128 # Must be divisible by FSDP * DDP * microbatch_num.
+  global_batch_size: 128 # Global across DP replicas; divisible by DP * microbatch_num.
   save_interval: 50
   target_iteration: 5000
   learning_rate: 0.0001

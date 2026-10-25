@@ -1,22 +1,70 @@
 import argparse
 import os
-from pathlib import Path
 import time
 from concurrent.futures import Future
 from contextlib import nullcontext
-from implementation.distributed.ddp_modules import FSDPWrapperPipelined
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import numpy as np
 import torch
 import torch.distributed as dist
-import numpy as np
-
 import yaml
+
+from implementation.distributed.ddp_modules import ParallelismWrapper
 from implementation.layers import TransformerLMPipelined
-from pipeline import pipelined_train_overlap
 from implementation.nnfunctions import cross_entropy, learning_rate_schedule_wrapper
 from implementation.optimizer import AdamW
-from implementation.train_utils import compile_model, get_batch, load_checkpoint_async_dist, load_dataset, save_checkpoint_async_dist
-from datetime import datetime, timedelta
-from implementation.startup import parallel_sizes, parallel_rank_groups
+from implementation.pipeline import pipelined_train_overlap
+from implementation.startup import parallel_sizes
+from implementation.train_utils import (
+    compile_model,
+    create_communication_groups,
+    get_batch,
+    load_checkpoint_async_dist,
+    load_dataset,
+    save_checkpoint_async_dist,
+)
+
+
+def _training_layout(config, world_size):
+    """Validate the global descriptor before creating distributed groups."""
+    shards = {**config["model"]["shard_model"], **config["train"]["shard_data"]}
+    names = ("TP", "EP", "FSDP", "PP", "DP")
+    if set(shards) - set(names):
+        raise ValueError("Unknown parallel dimension")
+    sizes = {name: shards.get(name, {}).get("shard", 1) for name in names}
+    if any(type(size) is not int or size < 1 for size in sizes.values()):
+        raise ValueError("Shard sizes must be positive integers")
+    shared = shards.get("EP", {}).get("use_tp_topology", False)
+    if type(shared) is not bool:
+        raise ValueError("EP.use_tp_topology must be a boolean")
+    independent = [name for name in names if not (name == "EP" and shared)]
+    if np.prod([sizes[name] for name in independent]) != world_size:
+        raise ValueError("Independent shard sizes must multiply to WORLD_SIZE")
+    if sizes["FSDP"] != 1:
+        raise ValueError("ParallelismWrapper does not yet support FSDP.shard > 1")
+    if shared:
+        sizes["EP"] = sizes["TP"]
+    model, train = config["model"], config["train"]
+    for value in (model["num_layers_model"], model["num_expert_model"],
+                  model["num_head"], train["global_batch_size"], train["microbatch_num"]):
+        if type(value) is not int or value < 1:
+            raise ValueError("Model dimensions and batch sizes must be positive integers")
+    if model["num_layers_model"] % sizes["PP"]:
+        raise ValueError("num_layers_model must be divisible by PP.shard")
+    if model["num_expert_model"] < 2 or model["num_expert_model"] % sizes["EP"]:
+        raise ValueError("num_expert_model must be at least two and divisible by effective EP size")
+    if model["num_head"] % (4 * sizes["TP"]):
+        raise ValueError("num_head must be divisible by 4 * TP.shard")
+    if train["global_batch_size"] % (sizes["DP"] * train["microbatch_num"]):
+        raise ValueError("global_batch_size must be divisible by DP.shard * microbatch_num")
+    return shards, sizes
+
+
+def _checkpoint_name(rank):
+    # Every rank owns a distinct optimizer/RNG snapshot, including TP/EP shards.
+    return f"rank_{rank}.ckpt"
 
 
 
@@ -24,14 +72,15 @@ def _nvtx_range(name):
     return torch.cuda.nvtx.range(name) if torch.cuda.is_available() else nullcontext()
 
 
-def _latest_checkpoint(root, dp_size, pp_size, run=None):
+def _latest_checkpoint(root, dp_size, pp_size, run=None, world_size=None):
     candidates = []
     for marker in Path(root).glob(f"{run or '*'}/*/COMMITTED"):
         directory = marker.parent
-        if directory.name.isdigit() and all(
+        complete = all((directory / _checkpoint_name(rank)).is_file() for rank in range(world_size)) if world_size is not None else all(
             (directory / f"shaded_dp_{dp}_pp_{pp}.ckpt").is_file()
             for dp in range(dp_size) for pp in range(pp_size)
-        ):
+        )
+        if directory.name.isdigit() and complete:
             candidates.append(directory)
     return max(candidates, key=lambda p: (p.parent.name, int(p.name)), default=None)
 
@@ -41,20 +90,30 @@ def _select_checkpoint(config, rank, info_src):
     if rank == info_src:
         try:
             settings = config["train"]
-            fsdp_size, ddp_size = parallel_sizes(settings)
+            new_schema = "shard_data" in settings
+            world_size = config["general"]["n_workers"] if new_schema else None
+            if new_schema:
+                _, sizes = _training_layout(config, world_size)
+                fsdp_size, ddp_size = sizes["FSDP"], sizes["DP"]
+                pp_size = sizes["PP"]
+            else:
+                fsdp_size, ddp_size = parallel_sizes(settings)
+                pp_size = settings["pipeline_parallel_stages"]
             data_parallel_size = fsdp_size * ddp_size
             load_checkpoint_path = settings.get("load_checkpoint_path")
             root = Path(config["general"]["checkpoint_folder"]) / "checkpoint"
             if load_checkpoint_path:
                 path = Path(load_checkpoint_path)
                 if int(os.environ.get("TORCHELASTIC_RESTART_COUNT", "0")):
-                    found = _latest_checkpoint(path.parent.parent, data_parallel_size, settings["pipeline_parallel_stages"], run=path.parent.name)
+                    found = _latest_checkpoint(path.parent.parent, data_parallel_size, pp_size, run=path.parent.name, world_size=world_size)
                     if found is not None and found.parent == path.parent:
                         path = found
                 if not (path / "COMMITTED").is_file():
                     raise ValueError(f"Checkpoint is not committed: {path}")
+                if new_schema and not all((path / _checkpoint_name(index)).is_file() for index in range(world_size)):
+                    raise ValueError(f"Checkpoint is missing rank shards: {path}")
             else:
-                path = _latest_checkpoint(root, data_parallel_size, settings["pipeline_parallel_stages"])
+                path = _latest_checkpoint(root, data_parallel_size, pp_size, world_size=world_size)
             selection[0] = str(path) if path is not None else None
         except Exception as error:
             selection[1] = str(error)
@@ -90,11 +149,9 @@ def _verify_pending_checkpoints(pending, iteration, rank, info_src, device, drai
 
 def train(local_rank, cluster_rank, world_size, config):
     glob_rank = int(os.environ["RANK"])
-    rank_groups = parallel_rank_groups(config["train"], world_size, config["general"]["gpu_per_node"])
-    fsdp_size, ddp_size = parallel_sizes(config["train"])
+    shards, sizes = _training_layout(config, world_size)
+    fsdp_size, ddp_size = sizes["FSDP"], sizes["DP"]
     data_parallel_size = fsdp_size * ddp_size
-    if config["train"]["microbatch_num"] < 1 or config["train"]["batch_size"] < 1 or config["train"]["batch_size"] % (data_parallel_size * config["train"]["microbatch_num"]):
-        raise ValueError("batch_size must be positive and divisible by FSDP * DDP * microbatch_num")
     if glob_rank % config["general"]["gpu_per_node"] != local_rank:
         raise ValueError("Node-local topology requires contiguous torchrun ranks per node")
     torch.cuda.set_device(local_rank)
@@ -106,8 +163,8 @@ def train(local_rank, cluster_rank, world_size, config):
     d_model = config.get("model").get("d_model")
     d_ff = config.get("model").get("d_ff")
     context_len = config.get("model").get("context_len")
-    num_layers = config.get("model").get("num_layers")
-    batch_size = config.get("train").get("batch_size")
+    num_layers = config["model"]["num_layers_model"]
+    batch_size = config["train"]["global_batch_size"]
     save_interval = config.get("train").get("save_interval")
     data_seed = config.get("data").get("seed", 42)
     validate_dataset = config.get("data").get("validate_dataset", False)
@@ -126,11 +183,11 @@ def train(local_rank, cluster_rank, world_size, config):
     print_loss_interval = config.get("train").get("print_loss_interval")
     optimizer_config = config.get("train").get("optimizer")
     learning_rate_scheduler_config = config.get("train").get("learning_rate_scheduler")
-    pipeline_parallel_stages = config.get("train").get("pipeline_parallel_stages")
+    pipeline_parallel_stages = sizes["PP"]
     microbatch_num = config.get("train").get("microbatch_num")
-    num_expert_per_node = config.get("model").get("num_expert_per_node")
-    fsdp_compute_dtype = torch.float16
-    pipeline_dtype = torch.float16
+    num_expert_model = config["model"]["num_expert_model"]
+    # Stage activations and P2P buffers must agree; parameters remain FP32.
+    pipeline_dtype = torch.bfloat16
     moe_compute_dtype = torch.bfloat16
     if device == "gpu":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -142,23 +199,18 @@ def train(local_rank, cluster_rank, world_size, config):
         torch.backends.cudnn.allow_tf32 = True
     rank = glob_rank
 
-    pipeline_stage_this = rank // data_parallel_size
-    # Flattened data index is unique across replicas, for RNG and checkpoints.
-    dp_idx = rank % data_parallel_size
-    groups = {}
-    for name, group_ranks in rank_groups.items():
-        for ranks in group_ranks:
-            group = dist.new_group(ranks=ranks, timeout=collective_timeout)
-            if rank in ranks:
-                groups[name] = group
-    fsdp_group, ddp_group = groups["fsdp"], groups["ddp"]
-    data_group, pp_group = groups["data"], groups["pp"]
+    groups = create_communication_groups(shards, config["general"].get("gpu_placement_priority"))
+    pp_group, data_group = groups["PP"], groups["DP"]
+    pipeline_stage_this = dist.get_rank(pp_group)
+    # These coordinates are constant across TP/EP peers and matching PP stages.
+    dp_idx = dist.get_rank(data_group)
 
     checkpoint_folder = config.get("general").get("checkpoint_folder")
     info_src = config.get("general").get("info_src")
     load_checkpoint_path = _select_checkpoint(config, rank, info_src)
     target_iteration = config.get("train").get("target_iteration")
 
+    torch.manual_seed(config["model"].get("seed", 42) + pipeline_stage_this)
     model = TransformerLMPipelined(
         vocab_size,
         context_len,
@@ -167,14 +219,14 @@ def train(local_rank, cluster_rank, world_size, config):
         num_head,
         pipeline_stage_this,
         pipeline_parallel_stages,
-        num_expert_per_node=num_expert_per_node,
+        num_expert_model=num_expert_model,
         d_ff=d_ff,
-        dp_group=fsdp_group,
         moe_compute_dtype=moe_compute_dtype,
+        compute_dtype=pipeline_dtype,
     )
     model.to(device)
     
-    model = FSDPWrapperPipelined(model, FSDP_communication_group=fsdp_group, DDP_communication_group=ddp_group if ddp_size > 1 else None, compute_dtype=fsdp_compute_dtype, moe_compute_dtype=moe_compute_dtype)
+    model = ParallelismWrapper(model, groups, compute_dtype=pipeline_dtype, moe_compute_dtype=moe_compute_dtype)
     optimizer = AdamW(model.parameters(), lr=learning_rate, betas=(optimizer_config["beta1"], optimizer_config["beta2"]), weight_decay=optimizer_config["lambda"])
 
     now = datetime.now()
@@ -183,7 +235,7 @@ def train(local_rank, cluster_rank, world_size, config):
     data_rng = np.random.default_rng(data_seed + dp_idx)
     if load_checkpoint_path:
         train_start_time = Path(load_checkpoint_path).parent.name
-        iteration = load_checkpoint_async_dist(load_checkpoint_path + f"/shaded_dp_{dp_idx}_pp_{pipeline_stage_this}.ckpt", model, optimizer, data_rng=data_rng)
+        iteration = load_checkpoint_async_dist(str(Path(load_checkpoint_path) / _checkpoint_name(rank)), model, optimizer, data_rng=data_rng)
         if iteration != int(Path(load_checkpoint_path).name):
             raise ValueError("Checkpoint shard iteration does not match committed directory")
         print(f"loaded checkpoint at {iteration} iterations, training start time is {train_start_time}")
@@ -254,6 +306,7 @@ def train(local_rank, cluster_rank, world_size, config):
                     device=device,
                     pp_group=pp_group,
                     dp_group=data_group,
+                    router_aux_loss_coef=config["train"].get("router_aux_loss_coef", 0.0),
                 )
             # Only block on the GPU when we are about to consume the timing
             # number (or profiling); per-interval timing stays accurate because
@@ -293,7 +346,7 @@ def train(local_rank, cluster_rank, world_size, config):
                     checkpoint_dir = f"{checkpoint_folder}/checkpoint/{train_start_time}/{iteration}"
                     try:
                         os.makedirs(checkpoint_dir, exist_ok=True)
-                        save_checkpoint_path = f"{checkpoint_dir}/shaded_dp_{dp_idx}_pp_{pipeline_stage_this}.ckpt"
+                        save_checkpoint_path = str(Path(checkpoint_dir) / _checkpoint_name(rank))
                         future = save_checkpoint_async_dist(model, optimizer, iteration, save_checkpoint_path, data_rng=data_rng)
                     except Exception as error:
                         future = Future()

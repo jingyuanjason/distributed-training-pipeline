@@ -2,29 +2,18 @@ import collections
 
 import torch
 import torch.distributed as dist
+
 from implementation.startup import validate_router_aux_loss_coef
 
 
 def backward_with_router_loss(output, grad, auxiliary, coefficient, split_num):
-    if auxiliary is None:
+    if not coefficient or not isinstance(auxiliary, torch.Tensor) or not auxiliary.requires_grad:
         output.backward(grad)
     else:
         torch.autograd.backward((output, auxiliary), (grad, auxiliary.new_tensor(coefficient / split_num)))
 
 
-def router_loss_metrics(task_loss, auxiliary, coefficient, pp_group, dp_group):
-    metrics = torch.stack((torch.as_tensor(task_loss, device=auxiliary.device).float(), auxiliary))
-    if pp_group is not None and pp_group.size() > 1:
-        dist.all_reduce(metrics, group=pp_group)
-    if dp_group is not None and dp_group.size() > 1:
-        dist.all_reduce(metrics, group=dp_group)
-        metrics /= dp_group.size()
-    return {"task_loss": metrics[0], "router_aux_loss": metrics[1],
-            "total_loss": metrics[0] + coefficient * metrics[1]}
-
-
-def pipelined_train_overlap(model, optimizer, x, x_label, x_spec: list[int], split_num, pipeline_stage_this, loss_fn, dtype=None, device=None, pp_group: dist.ProcessGroup = None, dp_group: dist.ProcessGroup = None, router_aux_loss_coef=0.0, return_metrics=False):
-
+def pipelined_train_overlap(model, optimizer, x, x_label, x_spec: list[int], split_num, pipeline_stage_this, loss_fn, dtype=None, device=None, pp_group: dist.ProcessGroup = None, dp_group: dist.ProcessGroup = None, router_aux_loss_coef=0.0):
     validate_router_aux_loss_coef(router_aux_loss_coef)
     if split_num <= 0:
         raise ValueError("split_num must be positive")
@@ -42,9 +31,7 @@ def pipelined_train_overlap(model, optimizer, x, x_label, x_spec: list[int], spl
     label_chunks = torch.split(x_label, split_size) if last_stage else None
     inputs = collections.deque()
     outputs = collections.deque()
-    auxiliary_total = torch.zeros((), device=device, dtype=torch.float32)
     optimizer.zero_grad(set_to_none=True)
-    model.clear_grad_accumulators()
     loss_total = 0.0
 
     def exchange(send_tensor=None, receive=False, downstream=True):
@@ -66,23 +53,21 @@ def pipelined_train_overlap(model, optimizer, x, x_label, x_spec: list[int], spl
         if not first_stage:
             x_in.requires_grad_(True)
         inputs.append(x_in)
-        x_out, auxiliary = model(x_in, return_aux_loss=True) if router_aux_loss_coef else (model(x_in), None)
-        outputs.append((x_out, auxiliary))
+        x_out = model(x_in)
+        outputs.append(x_out)
         return x_out
 
     def backward_microbatch(grad, microbatch_index):
         nonlocal loss_total
         x_in = inputs.popleft()
-        x_out, auxiliary = outputs.popleft()
-        if auxiliary is not None:
-            auxiliary_total.add_(auxiliary.detach() / split_num)
+        x_out = outputs.popleft()
+        auxiliary = model.collect_moe_lb_loss()
         if last_stage:
             loss = loss_fn(x_out, label_chunks[microbatch_index])
             loss_total += loss.detach() / split_num
             backward_with_router_loss(loss / split_num, None, auxiliary, router_aux_loss_coef, split_num)
         else:
             backward_with_router_loss(x_out, grad, auxiliary, router_aux_loss_coef, split_num)
-        model.accumulate_full_gradients()
         return None if first_stage else x_in.grad
 
     warmup_microbatches = min(pipeline_stage_total - pipeline_stage_this - 1, split_num)
@@ -112,9 +97,8 @@ def pipelined_train_overlap(model, optimizer, x, x_label, x_spec: list[int], spl
         if not first_stage:
             exchange(send_tensor=input_grad, downstream=False)
 
-    model.reduce_accumulated_gradients()
+    model.sync_gradients()
+    model.finish_gradient_synchronization()
     optimizer.step()
-    if return_metrics:
-        return router_loss_metrics(loss_total, auxiliary_total, router_aux_loss_coef, pp_group, dp_group)
     return loss_total
 

@@ -109,8 +109,26 @@ class ParallelismWrapper(nn.Module):
         self.parallel_communication_group = parallel_communication_groups
         self.module = module
         self.works = []
+        self._sync_initial_weights()
         self.register_TP()
         self.register_EP()
+
+    @torch.no_grad()
+    def _sync_initial_weights(self):
+        if not dist.is_available() or not dist.is_initialized():
+            return
+
+        seen_groups = set()
+        for name in ("TP", "EP", "FSDP", "DP"):
+            group = self.parallel_communication_group.get(name)
+            if group is None or id(group) in seen_groups:
+                continue
+            seen_groups.add(id(group))
+            if dist.get_world_size(group) <= 1:
+                continue
+            source_rank = dist.get_global_rank(group, 0)
+            for parameter in self.module.parameters():
+                dist.broadcast(parameter.detach(), src=source_rank, group=group)
 
 
     def register_TP(self):

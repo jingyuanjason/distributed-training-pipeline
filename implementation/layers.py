@@ -161,7 +161,9 @@ class MoELayer(nn.Module):
             raise ValueError("Require positive expert count and 1 <= k <= total experts")
         if dtype != torch.bfloat16:
             raise ValueError("Grouped MoE requires torch.bfloat16 compute dtype")
-        self.experts = GroupedPositionWiseFFLayer(num_experts, d_model, d_ff, device=device, dtype=dtype)
+        # Keep master parameters (and their accumulated gradients) in FP32;
+        # GroupedPositionWiseFFLayer casts weights to the activation dtype.
+        self.experts = GroupedPositionWiseFFLayer(num_experts, d_model, d_ff, device=device, dtype=torch.float32)
         self.router = LinearLayer(d_model, num_experts, device=device, dtype=dtype)
         self.num_experts = num_experts
         self.loss_material_queue = deque() # record the material for calculating loss, use queue for pipeline parallel microbatch handling
@@ -176,10 +178,11 @@ class MoELayer(nn.Module):
             ep_rank_this = dist.get_group_rank(self.communication_groups["EP"], dist.get_rank())
         
         input_dtype = x.dtype
-        x = x.to(self.dtype)
         batch_size, context_len = x.shape[:2]
         x = rearrange(x, "b c ... -> (b c) ...")
-        logits = self.router(x)
+        # Routing decisions and auxiliary statistics are sensitive to rounding.
+        logits = self.router(x.float())
+        x = x.to(self.dtype)
         
         routing_res: torch.Tensor = softmax(logits, dim_sum=-1)
         probs, expert_idx = routing_res.topk(self.k, dim=-1)
@@ -223,7 +226,7 @@ class MoELayer(nn.Module):
         out[assignment_order, :] = recv_tensors
 
         out = rearrange(out, " ... (c d) e -> ... c d e", d=self.k)
-        out = (out * probs.unsqueeze(dim=-1)).sum(dim=-2)
+        out = (out * probs.to(out.dtype).unsqueeze(dim=-1)).sum(dim=-2)
         out = rearrange(out, "(b c) ... -> b c ...", b = batch_size, c = context_len).to(input_dtype)
         return out
 
@@ -353,7 +356,7 @@ class MultiHeadLayerLL(nn.Module):
 
 class TransformerLayer(nn.Module):
 
-    def __init__(self, d_model, num_heads, d_ff, theta = 10000, moe_compute_dtype=torch.bfloat16):
+    def __init__(self, d_model, num_heads, d_ff, theta = 10000, moe_compute_dtype=torch.bfloat16, num_experts=4):
         super().__init__()
         self.d_model = d_model
         self.num_heads = num_heads
@@ -362,7 +365,7 @@ class TransformerLayer(nn.Module):
         self.ln1 = RMSNormLayer(d_model)
         self.attn = MultiHeadLayerLL(d_model, num_heads, theta=theta)
         self.ln2 = RMSNormLayer(d_model)
-        self.ffn = MoELayer(d_model, d_ff, dtype=moe_compute_dtype)
+        self.ffn = MoELayer(d_model, d_ff, num_experts=num_experts, dtype=moe_compute_dtype)
         self.communication_groups = defaultdict(lambda: None)
     
     def forward(self, x):
@@ -375,8 +378,11 @@ class TransformerLayer(nn.Module):
 
 class TransformerLMPipelined(nn.Module):
 
-    def __init__(self, vocab_size, context_length, d_model, num_layers_model, num_heads, pipeline_stage_this, pipeline_stage_total, d_ff=None, theta=10000, moe_compute_dtype=torch.bfloat16):
+    def __init__(self, vocab_size, context_length, d_model, num_layers_model, num_heads, pipeline_stage_this, pipeline_stage_total, d_ff=None, theta=10000, moe_compute_dtype=torch.bfloat16, num_expert_model=4, compute_dtype=torch.float32):
         super().__init__()
+        if compute_dtype not in (torch.float32, torch.bfloat16):
+            raise ValueError("compute_dtype must be torch.float32 or torch.bfloat16")
+        self.compute_dtype = compute_dtype
         self.communication_groups = defaultdict(lambda: None)
         if d_ff == None:
             d_ff = math.ceil(d_model * (8/3)/64)*64
@@ -392,7 +398,8 @@ class TransformerLMPipelined(nn.Module):
             self.token_embeddings = EmbeddingLayer(vocab_size, d_model)
         else:
             self.token_embeddings = None
-        self.layers = nn.Sequential(*[TransformerLayer(d_model, num_heads, d_ff, theta) for _ in range(self.num_layers_stage)])
+        self.num_expert_model = num_expert_model
+        self.layers = nn.Sequential(*[TransformerLayer(d_model, num_heads, d_ff, theta, moe_compute_dtype=moe_compute_dtype, num_experts=num_expert_model) for _ in range(self.num_layers_stage)])
         if self.pipeline_stage_this == self.pipeline_stage_total - 1:
             self.ln_final = RMSNormLayer(d_model)
             self.lm_head = LinearLayer(d_model, vocab_size)
@@ -403,6 +410,9 @@ class TransformerLMPipelined(nn.Module):
     def forward(self, x:torch.Tensor):
         if self.pipeline_stage_this == 0:
             x = self.token_embeddings(x)
+        # Cast activations, never model parameters: linear layers cast their
+        # FP32 weights transiently, preserving FP32 gradients and Adam states.
+        x = x.to(self.compute_dtype)
         x = self.layers(x)
         if self.pipeline_stage_this == self.pipeline_stage_total - 1:
             x = self.ln_final(x)
