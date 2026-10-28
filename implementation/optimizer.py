@@ -23,17 +23,19 @@ class AdamW(torch.optim.Optimizer):
                     continue
 
                 state = self.state[p]
-                g = p.grad.data
+                g = p.grad.detach().float()
                 # In-place updates: fewer kernel launches and no temporaries,
                 # matching the original update equations exactly.
                 p.data.mul_(1 - a * lambda_)
                 m = state.get("m")
                 if m is None:
-                    m = state["m"] = torch.zeros_like(p)
+                    m = torch.zeros_like(p, dtype=torch.float32)
+                m = state["m"] = m.float()
                 m.mul_(beta1).add_(g, alpha=1 - beta1)
                 v = state.get("v")
                 if v is None:
-                    v = state["v"] = torch.zeros_like(p)
+                    v = torch.zeros_like(p, dtype=torch.float32)
+                v = state["v"] = v.float()
                 v.mul_(beta2).addcmul_(g, g, value=1 - beta2)
                 denom = v.sqrt().add_(ep)
                 p.data.addcdiv_(m, denom, value=-a_t)

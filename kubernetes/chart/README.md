@@ -2,23 +2,26 @@
 
 ## Parallel topology
 
-The defaults use four nodes with eight GPUs each: FSDP=8, DDP=1, PP=4.
-`runConfig.train.fsdp_parallel_num` sets the shard/MoE routing group size;
-`runConfig.train.data_parallel_num` sets the DDP replica count. DDP groups
-connect matching shards. Each combined FSDP × DDP stage block stays within
-one node; pipeline groups may span nodes.
+The defaults use two nodes with eight GPUs each: TP=1, FSDP=2, DP=2, PP=4.
+Model parallel sizes live in `runConfig.model.shard_model`; data parallel
+sizes live in `runConfig.train.shard_data`. Each entry has a `shard` count.
+`EP.use_tp_topology=true` reuses TP groups instead of adding a rank dimension.
+`runConfig.general.gpu_placement_priority` lists fastest-varying dimensions
+first, favoring node-local placement when ranks are contiguous per node.
 
 The chart validates:
-- FSDP × DDP × PP equals `numNodes * gpusPerNode`.
-- FSDP × DDP divides `gpusPerNode`.
-- `batch_size` is divisible by FSDP × DDP × `microbatch_num`.
+- Independent TP × EP × FSDP × PP × DP equals `numNodes * gpusPerNode`.
+  EP is excluded when sharing TP topology.
+- `global_batch_size` is divisible by FSDP × DP × `microbatch_num`.
+- `model.num_layers_model` is divisible by PP shards.
 
-For FSDP=2 and DDP=4 on the same four eight-GPU nodes:
+For FSDP=2 and DP=4 on four eight-GPU nodes:
 
 ```bash
 helm template hybrid /home/jingyuan_li/pipeline_training/kubernetes/chart \
-  --set runConfig.train.fsdp_parallel_num=2 \
-  --set runConfig.train.data_parallel_num=4
+  --set numNodes=4 \
+  --set runConfig.train.shard_data.FSDP.shard=2 \
+  --set runConfig.train.shard_data.DP.shard=4
 ```
 
 Use a training image built from the updated code; the chart does not build or
@@ -27,9 +30,12 @@ cross-DDP initialization and gradient synchronization support before hybrid
 MoE training is fully synchronized. Do not resume checkpoints under a different
 FSDP/DDP topology.
 
-When migrating old Helm overrides, rename the old `data_parallel_num` value to
-`fsdp_parallel_num` and set `data_parallel_num=1`. Helm merges chart defaults,
-so simply omitting the new key from an override does not select legacy behavior.
+When migrating Helm overrides, replace `fsdp_parallel_num` and
+`data_parallel_num` with `shard_data.FSDP.shard` and `shard_data.DP.shard`;
+move `pipeline_parallel_stages` to `model.shard_model.PP.shard` and rename
+`batch_size` to `global_batch_size`. Model fields are now `num_layers_model`
+and `num_expert_model` (the latter is the total expert count), and
+`tokenizer_path` now lives under `data` rather than `general`.
 
 ## Runtime and memlock
 

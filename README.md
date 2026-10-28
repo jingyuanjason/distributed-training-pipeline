@@ -7,6 +7,8 @@ A distributed training implementation for a **BF16 Mixtral 8×7B MoE model**, in
 - **Hybrid Data Parallel (FSDP + DDP):** hybrid data parallel support in [distributed wrappers](implementation/distributed/ddp_modules.py). Support DDP on top of FSDP that replicate the workload for gradient sync.
 - **Expert Parallel (EP):** distributed experts and all-to-all token routing in [MoE layers](implementation/layers.py).
 - **Pipeline Parallel (PP):** microbatch scheduling and communication overlap in [pipeline training](pipeline/pipelined_train_overlap.py).
+- **Tensor Parallel (TP):** tensor parallel with MoE optimized for tensor parallel. Use one all-reduce instead of two all-to-all to save communication.
+- **Centralized parallelism initializer:** Designed a unified parallelism initializer for structured implementation
 - **Asynchronous training checkpoints:** improve distributed checkpoint saving (CPU Staging) and restoration for reliable training resumption.
 - **Kubernetes Support:** Run training job in kubernetes gpu cluster, with Kubeflow TrainJob
 
@@ -156,3 +158,7 @@ Local/Modal runs still use the separate
 ## AI-Generated Content
 
 AI generated portions of the training startup scripts, profiling setup, MoE loss collection, and project-structure cleanup/refactoring and some local test cases (not included in the repo). Also used AI for debugging.
+
+## Author
+
+Jingyuan Li
